@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: lacuna
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: LLM_PROVIDER
+        value: groq
+      - key: GROQ_API_KEY
+        sync: false   # set this in the Render dashboard, never commit it
+    # A persistent disk keeps the vector store (uploaded + auto-ingested
+    # documents) across deploys. Note: Render's free web tier doesn't
+    # support persistent disks, so this needs a paid instance type - on
+    # the free tier the index resets on every restart.
+    disk:
+      name: chroma-data
+      mountPath: /app/chroma_db
+      sizeGB: 1

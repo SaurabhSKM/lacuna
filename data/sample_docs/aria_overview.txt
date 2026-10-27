@@ -1,0 +1,19 @@
+Aria Cloud Storage - Product Overview
+
+Aria Cloud Storage is a file synchronization and backup service aimed at
+small and medium businesses. It was launched in 2021 and currently supports
+Windows, macOS, and Linux desktop clients, as well as iOS and Android mobile
+apps.
+
+Core features include automatic file versioning (up to 30 previous versions
+per file), end-to-end encryption for files marked as "private," shared team
+folders with granular permission controls, and a web-based admin console for
+managing user accounts and storage quotas.
+
+Aria offers three plans: Starter (100 GB per user), Team (1 TB per user,
+shared pool option available), and Enterprise (custom storage, dedicated
+support, and single sign-on integration via SAML).
+
+Aria does not currently support offline editing conflict resolution for
+documents edited simultaneously by more than 5 users; conflicts beyond that
+threshold require manual resolution by an admin.

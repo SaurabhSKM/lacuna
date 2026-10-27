@@ -1,0 +1,16 @@
+Aria Cloud Storage - Security Overview
+
+Aria encrypts all data in transit using TLS 1.3. Files marked as "private"
+are also encrypted at rest using AES-256, with encryption keys managed by
+Aria's key management service.
+
+Enterprise customers may optionally bring their own encryption keys (BYOK)
+through integration with AWS KMS or Azure Key Vault.
+
+Aria underwent a SOC 2 Type II audit in 2023 and renews this audit annually.
+Aria is not currently ISO 27001 certified, though certification is listed
+as a roadmap item without a committed date.
+
+Two-factor authentication (2FA) is available for all account tiers via
+authenticator app (TOTP) or SMS. Hardware security key support (FIDO2) is
+available only on the Enterprise plan.

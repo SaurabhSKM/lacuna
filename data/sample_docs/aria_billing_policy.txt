@@ -1,0 +1,20 @@
+Aria Cloud Storage - Billing and Refund Policy
+
+All Aria plans are billed monthly or annually. Annual billing gives a 15%
+discount compared to the monthly rate.
+
+Refunds: Customers on monthly plans may request a full refund within 14
+days of their initial charge if they have used less than 5 GB of storage.
+After 14 days, no refunds are issued for monthly plans, but customers may
+cancel at any time to stop future charges.
+
+Customers on annual plans may request a pro-rated refund for unused months
+within the first 60 days of the billing cycle, provided the account has not
+exceeded its Starter-tier storage limit (100 GB) during that period.
+
+Enterprise plan refunds are handled case-by-case under the terms of the
+signed Enterprise agreement and are not covered by this policy.
+
+Failed payments result in a 7-day grace period before the account is
+downgraded to a read-only state. Accounts remain read-only for 30 days
+before data deletion begins.

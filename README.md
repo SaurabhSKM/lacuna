@@ -36,7 +36,8 @@ flowchart TD
     C -->|accept| ACC[Accept, persist cited web findings]
     C -->|enrich, under cap| E[Enrichment: web search]
     E --> A
-    C -->|ask_user| CL[Needs clarification]
+    C -->|ask_user, under cap| CL[Ask the user]
+    CL -->|user answers| R
     C -->|enrich, cap reached| CAP[Best-effort answer, flagged]
     C -->|error| ERR[Error]
 ```
@@ -49,6 +50,7 @@ a real cycle, bounded by `MAX_ENRICHMENT_ITERATIONS`.
 | Ingestion | `src/ingest.py` | Load `.txt`/`.md`/`.pdf`, chunk, store in Chroma |
 | Embeddings | `src/embeddings.py` | Local ONNX embeddings via `fastembed`, no API key |
 | Retrieval | `src/retrieval.py` | Dense + BM25 fused with RRF, then a relevance gate |
+| Reranking | `src/rerank.py` | Local cross-encoder; off by default, see Evaluation |
 | Answerer | `src/rag.py` | Answer from numbered sources as a validated Pydantic object |
 | Completeness-checker | `src/completeness.py` | Independent critic: accept / enrich / ask_user |
 | Enrichment tool | `src/websearch.py` | DuckDuckGo search (no API key), dedup, persistence rules |
@@ -75,6 +77,44 @@ are combined with Reciprocal Rank Fusion rather than a weighted score,
 because dense relevance and BM25 scores aren't on a common scale and
 BM25's upper bound moves with the corpus; RRF only reads ranks, so there
 is nothing to recalibrate when documents are added.
+
+**`accept` has to mean two things at once, so it's checked as two.**
+"This answer is well-supported by the context" and "this question has
+been answered" are different claims, and they come apart precisely where
+it matters most: an answer that says *"the context does not state who the
+CTO is"* is maximally well-supported and resolves nothing. The critic
+judges support, so it accepted those — and the caller received a refusal
+labelled as a finished answer while the enrichment loop sat idle, because
+the gap was never routed anywhere. The critic now reports
+`answer_resolves_question` as a separate field, and a validator rejects
+`accept` without it, which turns a refusal into an enrichment round. This
+was invisible until the end-to-end benchmark was actually run; see
+Evaluation.
+
+**A clarification re-runs the pipeline; it does not resume a
+checkpoint.** `ask_user` used to be a dead end — the critic would
+correctly identify that a question was underspecified, name the
+ambiguity, and stop, so the most interesting routing decision produced
+the least useful outcome. It's now resumable, and the resume is a fresh
+graph run carrying the clarification history rather than a restored
+LangGraph checkpoint. That's deliberate: a clarification changes *which
+documents are relevant*, so it invalidates everything the previous run
+computed. Measured on the sample corpus, the ambiguous "What is the
+price?" retrieves **nothing at all** — correctly, it's too vague to clear
+the relevance floor — while "What is the price? the Team plan" retrieves
+three chunks. There is no retrieval state worth preserving, and a
+checkpointer would faithfully restore an empty result. Re-running is
+simpler, more correct, and keeps the service stateless enough to sit
+behind more than one replica.
+
+Retrieval uses the user's *replies*, not the questions we asked them —
+the replies are where the disambiguating terms are; our own wording only
+adds lexical noise. The critic sees the exchange too, for the same
+reason it sees the enrichment history: otherwise it asks the user to
+disambiguate something they just disambiguated. And the loop is capped
+(`MAX_CLARIFICATIONS`), because a critic that can ask for a
+clarification can ask forever, and "still ambiguous" is not a reason to
+keep a person answering questions.
 
 **Retrieval can return nothing, and that's a feature.** A chunk survives
 only if it has real evidence behind it: enough dense relevance, or
@@ -123,13 +163,28 @@ hallucinate a filename; plain Python maps them back. Provenance labels
 *are* shown to it, so it can weigh a document against a web result and
 is told to prefer the document when they conflict.
 
-**Persistence is narrow on purpose.** Web findings are written back only
-when an answer is *accepted*, only for results the answer actually
-*cited*, and only for URLs not already stored. A search for one gap
-returns three results, typically one of which contains the missing fact;
-persisting all three would add unvetted web text to the knowledge base
-for every gap closed, where it then competes with the user's own
-documents in every future retrieval.
+**Persistence is narrow on purpose, and narrower than it first was.**
+Web findings are written back only when an answer is *accepted*, only
+for results the answer actually *cited*, only for URLs not already
+stored, and only when the answer **also cites at least one document**.
+A search for one gap returns three results, typically one of which
+contains the missing fact; persisting all three would add unvetted web
+text to the knowledge base for every gap closed, where it then competes
+with the user's own documents in every future retrieval.
+
+The document-anchor rule was added after the unguarded version poisoned
+the index during testing, in a way that fed on itself. The vague
+question "What is the price?" was routed to enrichment, the search
+returned Wikipedia and Merriam-Webster on the *concept* of price, the
+critic accepted an answer built entirely from them, and all three were
+written into the store. From then on that same question retrieved those
+chunks, looked well-supported, and was accepted immediately without
+enrichment — so the contamination made the bad answer *more* likely each
+time rather than less. A document citation is the signal that a web
+result was filling a gap in a corpus-grounded answer, which is the
+designed case, rather than standing in for the corpus entirely. A
+web-only answer may still be a good answer; it just isn't evidence about
+the user's documents, so it doesn't earn a permanent place among them.
 
 **Optional integrations degrade to no-ops.** A missing API key, a failed
 search, or an unconfigured Langfuse never crashes the pipeline.
@@ -160,7 +215,22 @@ Measured, `TOP_K=4`, `MIN_RELEVANCE=0.4`, `bge-small-en-v1.5`:
 |---|---|---|---|---|
 | dense only (the original behaviour) | 100.0% | 0.973 | 47.0% | 0.0% |
 | dense + relevance gate | 100.0% | 0.973 | 47.9% | 100.0% |
-| **hybrid + relevance gate** | **100.0%** | **1.000** | **56.2%** | **100.0%** |
+| **hybrid + relevance gate** (default) | **100.0%** | **1.000** | **56.2%** | **100.0%** |
+| hybrid + cross-encoder rerank | 92.0% | 0.920 | 71.2% | 100.0% |
+
+**The reranker lost, and is off by default.** That last row is the
+measurement that stopped it shipping: it buys 15 points of precision and
+pays 8 points of hit@k, which is the wrong direction for this system. A
+chunk the gate drops means the corpus can no longer answer at all and
+the question goes out to web search; thin precision just leaves padding
+the critic already copes with. Concretely it returned *nothing* for
+"which permission levels can I assign to a user?" against a document
+whose section is headed "Roles" — a paraphrase the bi-encoders handle
+and `ms-marco-MiniLM` scored below threshold. It also had no ordering
+left to win, since fusion alone already scores MRR 1.000 here. The
+implementation stays in `src/rerank.py` (`RERANK=true`) because the
+reasoning for reranking still holds on a corpus where MRR isn't
+saturated — but it needs re-measuring there rather than assumed.
 
 Read these honestly. hit@k was already saturated — 28 chunks over 9
 documents is a small corpus and dense retrieval finds the right file for
@@ -196,24 +266,87 @@ produces a fabricated answer a user might trust. Overall accuracy and a
 per-category breakdown are reported too, but a single number hides which
 category regressed.
 
+A pipeline **error counts as incorrect in every category**, and the
+error rate is reported alongside the accuracy. This had to be fixed
+rather than designed: correctness for "unanswerable" was defined as
+`final_status != "accepted"`, so a crashed run scored as having
+correctly refused to fabricate — meaning a provider outage mid-run would
+quietly *improve* the headline number. Two questions hit it on a real
+run, which is the only reason it was noticed. A metric that credits its
+own failures is worse than no metric.
+
 `score()` is a pure function, so the scoring logic is unit-tested without
 an LLM (`tests/test_eval.py`). An optional RAGAS integration
 (`eval/ragas_eval.py`) adds faithfulness and relevancy scores on the
 answerable subset.
 
-> **Not yet recorded.** This one needs a real provider key, which the
-> environment this was last worked in didn't have. Run the command above
-> and fill the table in. `LLM_PROVIDER=stub` exercises the harness
-> end-to-end offline, but its "answers" are keyword matching with no
-> model behind them and its scores mean nothing — it's a wiring check,
-> not a result.
+14 questions, `gemini-3.5-flash-lite`, 2026-11-02. Three runs after the
+fix are shown rather than one, because the variance between them is
+itself a result — a single figure from the best run would be
+cherry-picking:
 
-| Metric | Value |
-|---|---|
-| Routing accuracy | _tbd_ |
-| False-negative rate | _tbd_ |
-| Model / provider | _tbd_ |
-| Date | _tbd_ |
+| Metric | Before the `accept` fix | After (3 runs) |
+|---|---|---|
+| Routing accuracy | 50.0% | 78.6% / 85.7% / **92.9%** |
+| **False-negative rate** | **100.0%** | **0.0% / 0.0% / 0.0%** |
+| answerable | 6/6 | 6/6 / 6/6 / 6/6 |
+| unanswerable | 0/5 | 4/5 / 5/5 / 5/5 |
+| ambiguous | 1/3 | 1/3 / 1/3 / 2/3 |
+| Pipeline errors | 0 | 2 / 0 / 0 |
+| Enrichment rounds used | 2 | 13 / 14 / 13 |
+
+What's stable and what isn't matters more than the headline. **The
+false-negative rate is 0.0% in every run, and `answerable` is 6/6 in
+every run** — those are the two claims the project rests on. The spread
+in overall accuracy comes almost entirely from the ambiguous category
+and from two transient pipeline errors in one run; the 4/5 on
+unanswerable is one of those errors, not a fabrication. 14 questions on
+one model is enough to show a 50%→85% shift is real and to find
+structural bugs. It is not enough for a second decimal place.
+
+Running this for the first time is what found the `accept` conflation
+described under Key design decisions, and the "before" column is worth
+keeping because of what it is *not*. A 100% false-negative rate reads
+like catastrophic hallucination; the system was in fact refusing
+correctly every time, at confidence 0.0, even correctly distinguishing
+Aria Cloud Storage from the unrelated real-world "ARIA" organisations the
+web search surfaced. Every component was right about the question it was
+individually asked. What was broken was that a supported refusal
+satisfied `accept`, so the user got a refusal presented as a finished
+answer — and the 2-rounds-across-14-questions figure shows the headline
+enrichment loop was almost entirely dormant as a direct result. Fixing
+the conflation is what took enrichment to ~13 rounds and the
+false-negative rate to zero.
+
+Running this for the first time is what found the `accept` conflation
+described under Key design decisions, and the "before" column is worth
+keeping because of what it is *not*. A 100% false-negative rate reads
+like catastrophic hallucination; the system was in fact refusing
+correctly every time, at confidence 0.0, even correctly distinguishing
+Aria Cloud Storage from the unrelated real-world "ARIA" organisations the
+web search surfaced. Every component was right about the question it was
+individually asked. What was broken was that a supported refusal
+satisfied `accept`, so the user got a refusal presented as a finished
+answer — and the 2-rounds-across-14-questions figure shows the headline
+enrichment loop was almost entirely dormant as a direct result. Fixing
+the conflation is what took enrichment to 14 rounds and the
+false-negative rate to zero.
+
+**The remaining weakness is ambiguity detection, and it is
+non-deterministic.** It scored 1/3, 1/3 and 2/3 across the three runs,
+and spot-checks of a single question ("What is the price?") have
+variously produced `ask_user`, an enrichment round, and an outright
+`accept`. "What happens if I cancel?" consistently gets `enrich` — it
+spots the insufficiency but picks the wrong remedy, since no search can
+tell it which plan you mean. This is the ceiling on the clarification
+loop: the loop itself works, but the critic has to notice the ambiguity
+before it can run.
+
+Not patched, deliberately. Three labelled questions is a sample to
+measure against, not to tune against, and leaning harder on `ask_user`
+in the prompt would put the 6/6 answerable score at risk — trading a
+reliable strength for an unreliable one. The fix is more labelled
+ambiguous cases first, then a change measured against them.
 
 ## API
 
@@ -223,6 +356,7 @@ answerable subset.
 | `GET /stats` | Chunk counts, including how many arrived via enrichment |
 | `POST /upload` | Multipart upload (`.txt`, `.md`, `.pdf`); searchable immediately |
 | `POST /query` | `{"question": "..."}` returns the answer, verdict, citations, and enrichment log |
+| `POST /clarify` | Answers an outstanding clarification request and resumes |
 | `POST /feedback` | Thumbs up/down on an answer, appended to `data/feedback.jsonl` |
 
 Interactive docs are at `/docs` when the service is running.
@@ -256,6 +390,10 @@ rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install -r requirements.t
 python scripts/build_index.py --docs data/sample_docs --persist ./chroma_db
 python scripts/ask_graph.py "What is the refund policy for monthly plans?"
 python scripts/ask_graph.py "Which release added FIDO2 support?" --show-retrieval
+
+# Ambiguous questions prompt for a clarification and then continue.
+# --clarify pre-supplies the answer, so a run can be scripted:
+python scripts/ask_graph.py "What is the price?" --clarify "the Team plan, annual billing"
 uvicorn src.api:app --reload            # or: docker compose up --build
 pytest                                  # no API key or network needed
 ```
@@ -281,8 +419,17 @@ configured, because the suite is entirely offline.
 
 ## Limitations
 
-- **The end-to-end benchmark has no recorded numbers.** See above. The
-  retrieval half is measured; the routing half needs a provider key.
+- **Ambiguity detection is the weakest routing category**, at 1/3. See
+  Evaluation. Not patched, because three labelled questions is a sample
+  to measure against, not to tune against. Note this limits how often
+  the clarification loop gets to run at all: the loop works, but the
+  critic has to notice the ambiguity first.
+- **Pending clarifications are held in-process.** The exchange itself is
+  just a few strings, but the token that identifies it lives in a dict,
+  so a second replica won't recognise it and a restart forgets it.
+  Swapping that store for Redis is the change to make before scaling
+  out, and it's a change of backing store only - `/query` also accepts
+  the exchange inline, so a stateless client can skip tokens entirely.
 - **The benchmark can't show enrichment *helping*.** The sample documents
   describe a fictional product, so a real web search can't find anything
   useful about it. The benchmark measures whether the system *refuses to
@@ -302,6 +449,15 @@ configured, because the suite is entirely offline.
   carrying the same text will both be stored. An embedding-similarity
   check would catch that; an exact URL match is cheaper and was the
   larger win.
+- **Auto-ingested content is filtered, not quality-assessed.** The
+  accepted/cited/document-anchored rules (see Key design decisions) all
+  ask *how the result was used*, not whether it is any good. A web page
+  that a corpus-grounded answer genuinely cites still enters the store
+  unvetted. The failure mode is specifically nasty because it compounds:
+  once a bad chunk is in, it gets retrieved, makes the next answer look
+  supported, and earns its own reinforcement. Content-level scoring
+  before write, and a way to review or revoke auto-ingested chunks, are
+  both still missing.
 - **Feedback is logged, not used.** `/feedback` records ratings. Nothing
   re-weights retrieval or flags documents from them yet.
 - **Search relies on an unofficial scraper library.** `ddgs` can be
@@ -330,7 +486,13 @@ configured, because the suite is entirely offline.
 - [x] Hybrid retrieval and a relevance gate, with a measured benchmark
 - [x] Unified document + web citations
 - [x] Query dedup and cited-only persistence
-- [ ] Record end-to-end evaluation results against a real provider
+- [x] Record end-to-end evaluation results against a real provider
+- [x] Separate "well-supported" from "actually answered" in the critic
+- [x] Cross-encoder reranking, measured and defaulted off on this corpus
+- [x] Make `ask_user` resumable instead of a dead end
+- [ ] Improve ambiguity detection on a larger labelled sample
+- [ ] Move pending clarifications to a shared store for multi-replica
+- [ ] Quality-score auto-ingested content, and make it reviewable
 - [ ] Evaluate on a real-world document set where enrichment can help
 - [ ] Use feedback to re-weight retrieval
 

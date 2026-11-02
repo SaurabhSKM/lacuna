@@ -44,10 +44,24 @@ Answer given:
 ---
 {answer}
 ---
-{history}
-Judge ONLY whether the retrieved context actually supports this answer. \
+{clarifications}{history}
+You are judging TWO separate things, and must not let one stand in for \
+the other:
+
+1. Does the retrieved context support what the answer claims?
+2. Does the answer actually resolve the question that was asked?
+
+These come apart in one specific and important case. If the answer says \
+"the context does not state X", that is perfectly supported by the \
+context - and it resolves nothing. It is a refusal, not an answer. Set \
+answer_resolves_question=false for it and do NOT choose "accept"; the \
+missing fact is precisely what a web search exists to go and find, so \
+choose "enrich" and name the missing fact as the gap. Reserve "accept" \
+for answers that genuinely tell the user what they asked for.
+
 Do not judge writing quality, fluency, or tone - a well-written answer built \
-on thin context is still a bad answer for this review.
+on thin context is still a bad answer for this review, and a fluent \
+refusal is still a refusal.
 
 Context blocks marked `web:` came from a general web search. Treat them as \
 weak evidence about the question's specific subject: a web result \
@@ -57,9 +71,12 @@ result for a claim about the question's specific subject, that is a gap, \
 not support.
 
 Guidelines:
-- "accept": the context directly supports the answer with no material gaps.
+- "accept": the context directly supports the answer with no material \
+gaps, AND the answer resolves the question.
 - "enrich": the answer is missing specific, nameable information that a \
-web search or additional document could plausibly fill in.
+web search or additional document could plausibly fill in - including \
+every case where the answer declines because the context doesn't cover \
+the question.
 - "ask_user": the question itself is ambiguous or underspecified in a way \
 no amount of extra retrieval would fix (e.g. missing a date range, unclear \
 which product/entity is meant).
@@ -106,17 +123,27 @@ def check_completeness(
     context: str,
     answer_text: str,
     enrichment_log: list = None,
+    clarifications: list = None,
     max_attempts: int = None,
 ) -> CompletenessVerdict:
     """
     Runs the independent critic call. Raises MissingAPIKeyError or
     RuntimeError on failure, same contract as rag.generate_answer(), so
     both can be handled identically by whatever calls them.
+
+    The critic sees any clarifications the user has already given, for
+    the same reason it sees the enrichment history: without them it is
+    stateless across turns and will ask the user to disambiguate
+    something they have already disambiguated, which is the most
+    irritating failure a clarification loop can have.
     """
+    from src.rag import format_clarifications
+
     prompt = COMPLETENESS_CHECK_PROMPT.format(
         question=question,
         context=context,
         answer=answer_text,
+        clarifications=format_clarifications(clarifications or []),
         history=format_history(enrichment_log or []),
     )
     llm = get_llm()

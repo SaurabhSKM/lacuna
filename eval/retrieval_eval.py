@@ -34,9 +34,10 @@ from src.retrieval import HybridRetriever
 from eval.retrieval_benchmark import RETRIEVAL_BENCHMARK, RETRIEVAL_DISTRACTORS
 
 CONFIGURATIONS = [
-    ("dense", {"hybrid": False, "min_relevance": 0.0}),
-    ("dense + gate", {"hybrid": False, "min_relevance": None}),
-    ("hybrid + gate", {"hybrid": True, "min_relevance": None}),
+    ("dense", {"hybrid": False, "min_relevance": 0.0, "rerank": False}),
+    ("dense + gate", {"hybrid": False, "min_relevance": None, "rerank": False}),
+    ("hybrid + gate", {"hybrid": True, "min_relevance": None, "rerank": False}),
+    ("hybrid + rerank", {"hybrid": True, "min_relevance": None, "rerank": True}),
 ]
 
 
@@ -98,11 +99,15 @@ def score_retrieval(gold_sets: list, retrieved_filenames: list, distractor_count
     }
 
 
-def evaluate_configuration(vectorstore, hybrid, min_relevance) -> dict:
+def evaluate_configuration(
+    vectorstore, hybrid, min_relevance, rerank=None, rerank_min_score=None
+) -> dict:
     retriever = HybridRetriever(
         vectorstore,
         hybrid=hybrid,
         min_relevance=config.MIN_RELEVANCE if min_relevance is None else min_relevance,
+        rerank=rerank,
+        rerank_min_score=rerank_min_score,
     )
 
     retrieved_filenames, misses = [], []

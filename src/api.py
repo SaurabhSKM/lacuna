@@ -17,8 +17,11 @@ reasons:
 """
 import json
 import os
+import secrets
 import shutil
 import tempfile
+import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Literal, Optional
@@ -63,6 +66,78 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
 _state = {"vectorstore": None, "graph_app": None, "retriever": None}
 
 
+class PendingClarifications:
+    """
+    Open clarification requests, keyed by an opaque id.
+
+    Deliberately small: a clarification turn needs the original question
+    and the exchange so far, and nothing else. The graph run itself is
+    not checkpointed - resuming re-runs it with the clarification
+    attached, because a clarification changes which documents are
+    relevant and invalidates whatever the previous run retrieved (see
+    graph.run_question).
+
+    That keeps what has to be stored to a few strings, which is why an
+    in-process dict is defensible here. It is still process-local: a
+    second replica won't recognise the id, and a restart forgets them.
+    Moving this to Redis is the change to make before running more than
+    one instance, and it is a change of backing store only - nothing
+    else in the pipeline becomes stateful.
+
+    Entries expire, and the store is bounded, so an abandoned
+    conversation cannot accumulate into a slow memory leak or let a
+    caller pin memory open by never answering.
+    """
+
+    def __init__(self, ttl_seconds: int = None, max_entries: int = None):
+        # `is None`, not `or`: a ttl of 0 is a legitimate value meaning
+        # "expire immediately", and `0 or 3600` silently becomes 3600.
+        self.ttl = config.CLARIFICATION_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+        self.max_entries = (
+            config.MAX_PENDING_CLARIFICATIONS if max_entries is None else max_entries
+        )
+        self._entries = OrderedDict()
+
+    def _evict(self):
+        now = time.monotonic()
+        for key in [k for k, v in self._entries.items() if now - v["created"] > self.ttl]:
+            del self._entries[key]
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)  # oldest first
+
+    def open(self, question: str, clarifications: list, request: str) -> str:
+        token = secrets.token_urlsafe(16)
+        self._entries[token] = {
+            "question": question,
+            "clarifications": list(clarifications or []),
+            "request": request,
+            "created": time.monotonic(),
+        }
+        # Evicted after inserting, not before: evicting first leaves room
+        # for the new entry and lets the store sit one over its bound.
+        self._evict()
+        return token
+
+    def take(self, token: str):
+        """
+        Fetch and remove. Removing on use means a token is single-shot:
+        answering the same request twice would otherwise fork the
+        conversation off one id, and the second answer would silently
+        replace the first.
+        """
+        self._evict()
+        return self._entries.pop(token, None)
+
+    def clear(self):
+        self._entries.clear()
+
+    def __len__(self):
+        return len(self._entries)
+
+
+_pending = PendingClarifications()
+
+
 def get_state() -> dict:
     if _state["vectorstore"] is None:
         from langchain_chroma import Chroma
@@ -98,15 +173,35 @@ class UploadResponse(BaseModel):
     chunks_added: int
 
 
+class ClarificationTurn(BaseModel):
+    question_asked: str
+    user_answer: str = Field(min_length=1, max_length=2000)
+
+
 class QueryRequest(BaseModel):
     # min_length=1 so a blank question is a 422 from the contract rather
     # than an embedding call on an empty string followed by a confused
     # answer about nothing.
     question: str = Field(min_length=1, max_length=4000)
+    # Lets a stateless client carry the exchange itself instead of
+    # holding a server-side token - useful behind a load balancer, and
+    # the reason the graph takes clarifications as plain data rather
+    # than hiding them in a checkpoint.
+    clarifications: List[ClarificationTurn] = []
+
+
+class ClarifyRequest(BaseModel):
+    clarification_id: str = Field(min_length=1, max_length=200)
+    answer: str = Field(min_length=1, max_length=2000)
 
 
 class QueryResponse(BaseModel):
     status: str
+    # Present when status is "needs_clarification": what to ask the user,
+    # and the token to send their reply back with.
+    clarification_request: Optional[str] = None
+    clarification_id: Optional[str] = None
+    clarifications: List[ClarificationTurn] = []
     answer: Optional[str] = None
     confidence: Optional[float] = None
     missing_info: List[str] = []
@@ -220,13 +315,57 @@ async def upload(file: UploadFile = File(...)):
 @app.post("/query", response_model=QueryResponse)
 def query(payload: QueryRequest):
     state = get_state()
-    result = run_question(state["graph_app"], payload.question)
+    clarifications = [c.model_dump() for c in payload.clarifications]
+    result = run_question(state["graph_app"], payload.question, clarifications)
+    return _to_response(payload.question, clarifications, result)
 
+
+@app.post("/clarify", response_model=QueryResponse)
+def clarify(payload: ClarifyRequest):
+    """
+    Answer an outstanding clarification request and continue.
+
+    This is what makes `ask_user` a real outcome rather than a dead end:
+    the critic identifies that a question is underspecified, names the
+    ambiguity, and the user's reply comes back in here to finish the job.
+    """
+    pending = _pending.take(payload.clarification_id)
+    if pending is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Unknown or expired clarification_id. Clarification requests "
+                "are single-use and expire; ask the question again to get a "
+                "new one."
+            ),
+        )
+
+    clarifications = pending["clarifications"] + [
+        {"question_asked": pending["request"], "user_answer": payload.answer}
+    ]
+    state = get_state()
+    result = run_question(state["graph_app"], pending["question"], clarifications)
+    return _to_response(pending["question"], clarifications, result)
+
+
+def _to_response(question: str, clarifications: list, result: dict) -> QueryResponse:
     answer = result.get("structured_answer")
     verdict = result.get("completeness_verdict")
+    status = result.get("final_status") or "unknown"
+
+    # A clarification request is only resumable if there's a token to
+    # resume it with, so the token is minted here rather than in the
+    # graph - the graph stays free of transport concerns.
+    clarification_id = None
+    request = result.get("clarification_request")
+    if status == "needs_clarification" and request:
+        clarification_id = _pending.open(question, clarifications, request)
 
     return QueryResponse(
-        status=result.get("final_status") or "unknown",
+        status=status,
+        clarification_request=request,
+        clarification_id=clarification_id,
+        clarifications=[ClarificationTurn(**c) for c in clarifications],
         answer=answer.answer if answer else None,
         confidence=answer.confidence if answer else None,
         missing_info=answer.missing_info if answer else [],

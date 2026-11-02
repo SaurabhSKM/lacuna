@@ -195,14 +195,43 @@ class HybridRetriever:
     reused across questions instead of rebuilt per query.
     """
 
-    def __init__(self, vectorstore, hybrid: bool = None, min_relevance: float = None):
+    def __init__(
+        self,
+        vectorstore,
+        hybrid: bool = None,
+        min_relevance: float = None,
+        rerank: bool = None,
+        rerank_min_score: float = None,
+    ):
         self.vectorstore = vectorstore
         self.hybrid = config.HYBRID_RETRIEVAL if hybrid is None else hybrid
         self.min_relevance = config.MIN_RELEVANCE if min_relevance is None else min_relevance
+        self.rerank = config.RERANK if rerank is None else rerank
+        self.rerank_min_score = (
+            config.RERANK_MIN_SCORE if rerank_min_score is None else rerank_min_score
+        )
         self._bm25 = BM25Index()
         # Populated by the last retrieve() call, for /stats and for the
         # CLI's --show-context output. Diagnostics only; nothing routes on it.
         self.last_debug = {}
+
+    def _rerank_scores(self, question: str, docs: list) -> dict:
+        """
+        {doc_key: relevance} from the cross-encoder, or {} if reranking
+        is off or unavailable. Returning {} on failure is deliberate:
+        the reranker is a precision refinement over a candidate pool
+        that is already correctly ordered by fusion, so losing it should
+        degrade retrieval to the previous behaviour rather than break it.
+        """
+        if not self.rerank or not docs:
+            return {}
+        try:
+            from src.rerank import get_reranker
+
+            scores = get_reranker().score(question, [d.page_content for d in docs])
+        except Exception:
+            return {}
+        return {_doc_key(doc): score for doc, score in zip(docs, scores)}
 
     def _dense(self, question: str, k: int) -> list:
         """[(Document, relevance)] best-first. relevance is in [0,1]."""
@@ -248,6 +277,15 @@ class HybridRetriever:
         ])
         ranked = sorted(by_key, key=lambda key: fused.get(key, 0.0), reverse=True)
 
+        # Precision stage. Fusion decided what is in the pool; the
+        # cross-encoder decides the order within it, by actually reading
+        # the question and the chunk together. When it's available its
+        # score also replaces vector distance as the gate's input, which
+        # is the question the gate was always trying to ask.
+        rerank_scores = self._rerank_scores(question, [by_key[key] for key in ranked])
+        if rerank_scores:
+            ranked.sort(key=lambda key: rerank_scores.get(key, 0.0), reverse=True)
+
         # Whether the store could produce normalised relevance at all, as
         # distinct from a particular chunk having no dense score because
         # it was a lexical-only candidate. Conflating those two is a trap:
@@ -259,17 +297,21 @@ class HybridRetriever:
 
         kept = [
             key for key in ranked
-            if self._passes_gate(key, dense_relevance, lexical_coverage, dense_scores_available)
+            if self._passes_gate(
+                key, dense_relevance, lexical_coverage, dense_scores_available, rerank_scores
+            )
         ]
         self.last_debug = {
             "dense": len(dense),
             "lexical": len(lexical),
+            "reranked": len(rerank_scores),
             "kept": len(kept[:k]),
             "gated_out": len(ranked) - len(kept),
             "scores": {
                 key: {
                     "dense": dense_relevance.get(key),
                     "lexical": round(lexical_coverage.get(key, 0.0), 3),
+                    "rerank": round(rerank_scores[key], 4) if key in rerank_scores else None,
                     "fused": round(fused.get(key, 0.0), 5),
                 }
                 for key in ranked[:k]
@@ -283,9 +325,19 @@ class HybridRetriever:
         dense_relevance: dict,
         lexical_coverage: dict,
         dense_scores_available: bool = True,
+        rerank_scores: dict = None,
     ) -> bool:
         """
-        A chunk survives if EITHER retriever has real evidence for it.
+        A chunk survives if something has real evidence for it.
+
+        When a reranker score is available it decides alone, and the
+        other two signals are ignored. That isn't a shortcut: dense
+        distance and IDF coverage are both proxies for "is this chunk
+        about the question", used because scoring the pair directly over
+        a whole collection is too expensive. Once the pair *has* been
+        scored directly over the candidate pool, consulting the proxies
+        as well would only let a chunk the cross-encoder rejected back in
+        on weaker evidence.
 
         Dense side: relevance >= min_relevance. The threshold is
         calibrated against Chroma's default L2 metric, where an off-topic
@@ -305,6 +357,11 @@ class HybridRetriever:
         """
         if self.min_relevance <= 0:
             return True
+
+        rerank_scores = rerank_scores or {}
+        if key in rerank_scores:
+            return rerank_scores[key] >= self.rerank_min_score
+
         if lexical_coverage.get(key, 0.0) >= self.min_relevance:
             return True
 

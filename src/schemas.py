@@ -78,12 +78,25 @@ class CompletenessVerdict(BaseModel):
 
     action: Literal["accept", "enrich", "ask_user"] = Field(
         description=(
-            "'accept': the context directly supports the answer with no "
-            "material gaps. 'enrich': the answer is missing specific, "
-            "nameable information a web search or additional document "
-            "could plausibly fill in. 'ask_user': the question itself is "
-            "ambiguous or underspecified in a way no amount of extra "
-            "retrieval would fix."
+            "'accept': the context directly supports the answer AND the "
+            "answer actually resolves the question. 'enrich': the answer "
+            "is missing specific, nameable information a web search or "
+            "additional document could plausibly fill in - including the "
+            "case where the answer declines to answer because the "
+            "context doesn't cover the question. 'ask_user': the question "
+            "itself is ambiguous or underspecified in a way no amount of "
+            "extra retrieval would fix."
+        )
+    )
+
+    answer_resolves_question: bool = Field(
+        description=(
+            "True only if the answer actually tells the user what they "
+            "asked for. False if the answer instead reports that the "
+            "information is absent, unavailable, or not covered by the "
+            "context - however well-written and however correctly it "
+            "says so. An answer that says 'the context does not state X' "
+            "is a refusal, not an answer, and must be False."
         )
     )
 
@@ -106,6 +119,42 @@ class CompletenessVerdict(BaseModel):
     reasoning: str = Field(
         description="One or two sentences justifying the verdict."
     )
+
+    @model_validator(mode="after")
+    def _accept_requires_a_resolved_question(self):
+        """
+        The defect this closes, which only showed up once the end-to-end
+        benchmark was actually run: every single unanswerable question
+        came back as `accepted`, at sufficiency 1.0.
+
+        Nothing was fabricating. The Answerer correctly said "the context
+        does not state who the CTO is" at confidence 0.0. The critic was
+        asked whether the context supported that answer - and it does,
+        completely, so it accepted. Both components were right about the
+        question they were each asked.
+
+        The conflation was in `accept` itself, which was carrying two
+        claims at once: "this answer is well-supported" and "this
+        question has been answered". A refusal is maximally
+        well-supported and entirely unanswered, so it satisfied the only
+        one of those that was ever checked, and the caller received a
+        refusal labelled as a finished answer. The enrichment loop never
+        ran either, because the gap was never routed anywhere - two
+        enrichment rounds across fourteen questions.
+
+        Separating the two claims is what makes the loop work: a refusal
+        now routes to enrichment, which is exactly the case web search
+        exists for.
+        """
+        if self.action == "accept" and not self.answer_resolves_question:
+            raise ValueError(
+                "action 'accept' requires answer_resolves_question=True. "
+                "The answer reports that the information is absent rather "
+                "than supplying it, so the question is unresolved: choose "
+                "'enrich' if a search could plausibly find it, or "
+                "'ask_user' if the question itself is ambiguous."
+            )
+        return self
 
     @model_validator(mode="after")
     def _gap_required_for_non_accept(self):

@@ -34,11 +34,14 @@ from src.retrieval import HybridRetriever
 from src.schemas import CompletenessVerdict, RAGResponse
 
 
-def make_verdict(action, sufficiency=0.5, gap=None):
+def make_verdict(action, sufficiency=0.5, gap=None, resolves=None):
     return CompletenessVerdict(
         action=action,
+        # "accept" is only valid when the answer resolved the question;
+        # anything else implies it didn't.
+        answer_resolves_question=(action == "accept") if resolves is None else resolves,
         sufficiency_score=sufficiency,
-        gap_description=gap,
+        gap_description=gap or (None if action == "accept" else "a specific missing figure"),
         reasoning="test reasoning",
     )
 
@@ -175,6 +178,28 @@ def test_accept_node_does_not_persist_an_uncited_web_source():
     node = make_accept_node(make_store(), persist_enrichment=True)
     result = node(accept_state([1], [WEB_RESULT]))
     assert result["persisted_web_sources"] == 0
+
+
+def test_accept_node_does_not_persist_a_web_only_answer():
+    # The incident this prevents: "What is the price?" was enriched, the
+    # search returned Wikipedia and a dictionary on the *concept* of
+    # price, the critic accepted an answer built only from those, and all
+    # three were written into the knowledge base - after which the same
+    # question retrieved them, looked supported, and was accepted
+    # instantly. The contamination made the bad answer more likely each
+    # time rather than less.
+    node = make_accept_node(make_store(), persist_enrichment=True)
+    # id 2 is the web result; id 1 (the document) is deliberately uncited.
+    result = node(accept_state([2], [WEB_RESULT]))
+    assert result["final_status"] == "accepted"
+    assert [c.kind for c in result["citations"]] == ["web"]
+    assert result["persisted_web_sources"] == 0
+
+
+def test_web_only_answer_still_persists_when_the_anchor_is_disabled(monkeypatch):
+    monkeypatch.setattr("src.config.config.PERSIST_REQUIRES_DOC_ANCHOR", False)
+    node = make_accept_node(make_store(), persist_enrichment=True)
+    assert node(accept_state([2], [WEB_RESULT]))["persisted_web_sources"] == 1
 
 
 def test_accept_node_skips_persistence_when_disabled():

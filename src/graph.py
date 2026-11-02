@@ -49,6 +49,15 @@ from src.schemas import RAGResponse, CompletenessVerdict, Citation
 
 class GraphState(TypedDict):
     question: str
+    # Clarification turns already supplied, oldest first. Each is
+    # {"question_asked": ..., "user_answer": ...}. Carried INTO a run
+    # rather than accumulated during one: a clarification can only come
+    # from outside the graph, so a run either has them at the start or
+    # ends by asking for one.
+    clarifications: List[dict]
+    # Set when the run ends by asking the user something. This is what a
+    # caller needs in order to resume.
+    clarification_request: Optional[str]
     retrieved_docs: List[Document]
     web_sources: List[dict]          # deduped search results, accumulated across loops
     source_refs: List[rag.SourceRef]  # documents + web results in one numbered sequence
@@ -66,7 +75,7 @@ class GraphState(TypedDict):
     error: Optional[str]
 
 
-def initial_state(question: str) -> dict:
+def initial_state(question: str, clarifications: list = None) -> dict:
     """
     The starting state, in one place.
 
@@ -79,6 +88,8 @@ def initial_state(question: str) -> dict:
     """
     return {
         "question": question,
+        "clarifications": list(clarifications or []),
+        "clarification_request": None,
         "retrieved_docs": [],
         "web_sources": [],
         "source_refs": [],
@@ -119,7 +130,13 @@ def _citations_for(state: GraphState) -> dict:
 
 def make_retrieve_node(retriever: HybridRetriever):
     def retrieve_node(state: GraphState) -> dict:
-        docs = retriever.retrieve(state["question"])
+        # Retrieve on the clarified query, not the raw question. On a
+        # first pass these are identical; after a clarification the
+        # user's own disambiguating words are what make retrieval work
+        # at all.
+        docs = retriever.retrieve(
+            rag.retrieval_query(state["question"], state.get("clarifications"))
+        )
         refs = rag.build_source_refs(docs)
         return {
             "retrieved_docs": docs,
@@ -133,7 +150,11 @@ def make_retrieve_node(retriever: HybridRetriever):
 
 def answer_node(state: GraphState) -> dict:
     try:
-        answer = rag.generate_answer(state["full_context"], state["question"])
+        answer = rag.generate_answer(
+            state["full_context"],
+            state["question"],
+            clarifications=state.get("clarifications"),
+        )
     except (MissingAPIKeyError, RuntimeError) as e:
         return {"error": str(e), "final_status": "error"}
     return {"structured_answer": answer}
@@ -150,6 +171,7 @@ def completeness_node(state: GraphState) -> dict:
             state["full_context"],
             answer.answer,
             enrichment_log=state.get("enrichment_log", []),
+            clarifications=state.get("clarifications"),
         )
     except (MissingAPIKeyError, RuntimeError) as e:
         return {"error": str(e), "final_status": "error"}
@@ -228,13 +250,21 @@ def make_accept_node(vectorstore, persist_enrichment: bool = True):
         resolved = _citations_for(state)
         persisted = 0
         if persist_enrichment and state.get("web_sources"):
-            cited_urls = {c.url for c in resolved["citations"] if c.kind == "web" and c.url}
-            persisted = websearch.persist_web_sources(
-                vectorstore,
-                state["web_sources"],
-                state["question"],
-                cited_urls=cited_urls,
-            )
+            citations = resolved["citations"]
+            cited_urls = {c.url for c in citations if c.kind == "web" and c.url}
+            # An answer that cites no document isn't grounded in the
+            # user's corpus at all, so writing its web sources into that
+            # corpus is how the corpus stops being theirs. See
+            # PERSIST_REQUIRES_DOC_ANCHOR for the incident that put this
+            # guard here.
+            anchored = any(c.kind == "document" for c in citations)
+            if anchored or not config.PERSIST_REQUIRES_DOC_ANCHOR:
+                persisted = websearch.persist_web_sources(
+                    vectorstore,
+                    state["web_sources"],
+                    state["question"],
+                    cited_urls=cited_urls,
+                )
         return {
             "final_status": "accepted",
             "persisted_web_sources": persisted,
@@ -245,7 +275,24 @@ def make_accept_node(vectorstore, persist_enrichment: bool = True):
 
 
 def clarification_node(state: GraphState) -> dict:
-    return {"final_status": "needs_clarification", **_citations_for(state)}
+    """
+    Terminal, but resumable: it publishes the question to put to the
+    user in `clarification_request`, which is the whole input a caller
+    needs to start the next turn.
+
+    This used to be a dead end - it reported that the question was
+    ambiguous and stopped, so the most interesting routing decision the
+    critic could make produced the least useful outcome.
+    """
+    verdict = state.get("completeness_verdict")
+    request = (verdict.gap_description if verdict else None) or (
+        "Could you be more specific about what you're asking?"
+    )
+    return {
+        "final_status": "needs_clarification",
+        "clarification_request": request,
+        **_citations_for(state),
+    }
 
 
 def max_iterations_node(state: GraphState) -> dict:
@@ -295,7 +342,15 @@ def route_after_completeness(state: GraphState) -> str:
 
     if verdict.action == "accept":
         return "accept"
+
     if verdict.action == "ask_user":
+        # Same reasoning as the enrichment cap, one level up: a critic
+        # that can ask for a clarification can ask forever, and "still
+        # ambiguous" is not a reason to keep a user answering questions.
+        # Past the cap, answer as best we can and flag it rather than
+        # bouncing the question back a third time.
+        if len(state.get("clarifications") or []) >= config.MAX_CLARIFICATIONS:
+            return "max_iterations"
         return "ask_user"
 
     # action == "enrich"
@@ -365,9 +420,20 @@ def build_graph(vectorstore, persist_enrichment: bool = True, retriever=None):
     return graph.compile()
 
 
-def run_question(app, question: str) -> dict:
+def run_question(app, question: str, clarifications: list = None) -> dict:
     """
     Invoke the compiled graph for one question, inside one trace.
+
+    `clarifications` resumes an earlier run that ended in
+    `needs_clarification`. Resuming is a fresh graph run carrying the
+    clarification history, not a restored checkpoint, because a
+    clarification changes which documents are relevant and therefore
+    invalidates everything the previous run computed. Measured on the
+    sample corpus: the ambiguous "What is the price?" retrieves nothing
+    at all, so there is no retrieval state worth restoring - a
+    checkpointer would faithfully reinstate an empty result. Re-running
+    is both simpler and more correct here, and it keeps the service
+    stateless enough to run behind more than one replica.
 
     The trace wrapper is here rather than at each call site so that every
     entry point - HTTP, CLI, eval - produces the same trace shape. It
@@ -378,4 +444,4 @@ def run_question(app, question: str) -> dict:
     which critique.
     """
     with tracing.question_trace(question):
-        return app.invoke(initial_state(question))
+        return app.invoke(initial_state(question, clarifications))

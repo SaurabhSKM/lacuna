@@ -125,12 +125,34 @@ def test_a_permanent_error_is_not_retried():
 
 
 def test_transient_failures_back_off(monkeypatch):
+    # Jitter is pinned, because it makes the naive assertion
+    # (delays[1] > delays[0]) flaky: the delays are
+    # base * 2**(n-1) * (0.5 + random()), so an unlucky pair can be
+    # 1.49 then 1.01 and the test fails perhaps one run in six. Pinning
+    # the random factor tests the exponential growth that's actually
+    # being asserted, rather than the jitter on top of it.
     delays = []
     monkeypatch.setattr(llm_module.time, "sleep", lambda seconds: delays.append(seconds))
+    monkeypatch.setattr(llm_module.random, "random", lambda: 0.5)
     fake = FakeLLM(RuntimeError("service unavailable 503"), failures=2)
     invoke_structured(fake, Shape, "prompt", max_attempts=3)
-    assert len(delays) == 2
-    assert delays[1] > delays[0]  # exponential, with jitter
+
+    base = llm_module.config.LLM_BACKOFF_SECONDS
+    assert delays == [base * 1.0, base * 2.0]
+
+
+def test_backoff_jitter_stays_within_its_band(monkeypatch):
+    # The jitter is meant to spread retries so that several nodes sharing
+    # a rate limit don't collide again in lockstep. Bounds, not an exact
+    # value, since the whole point is that it varies.
+    delays = []
+    monkeypatch.setattr(llm_module.time, "sleep", lambda seconds: delays.append(seconds))
+    fake = FakeLLM(RuntimeError("429 rate limit"), failures=1)
+    invoke_structured(fake, Shape, "prompt", max_attempts=2)
+
+    base = llm_module.config.LLM_BACKOFF_SECONDS
+    assert len(delays) == 1
+    assert 0.5 * base <= delays[0] <= 1.5 * base
 
 
 def test_validation_failures_do_not_back_off(monkeypatch):

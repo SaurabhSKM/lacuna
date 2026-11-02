@@ -52,11 +52,59 @@ Context:
 ---
 
 Question: {question}
-
+{clarifications}
 Fill in the response fields honestly. In particular: your confidence score \
 must reflect how well the CONTEXT covers the question, not how fluent your \
 answer sounds. If the context only partially addresses the question, say \
 so in missing_info rather than filling gaps with assumptions."""
+
+
+CLARIFICATION_BLOCK_TEMPLATE = """
+The user's question was ambiguous, and they have since clarified it. \
+Treat the clarifications as part of the question - they are the user's \
+own words and override any other reading of it:
+{exchanges}
+Answer the question as clarified. Do not ask for the same clarification \
+again."""
+
+
+def format_clarifications(clarifications: list) -> str:
+    """
+    Render the clarification exchange for a prompt. Pure function, so
+    it's unit-testable without an LLM, same as resolve_citations.
+    """
+    if not clarifications:
+        return ""
+    lines = []
+    for item in clarifications:
+        lines.append(f"  Asked: {item.get('question_asked', '')}")
+        lines.append(f"  User replied: {item.get('user_answer', '')}")
+    return CLARIFICATION_BLOCK_TEMPLATE.format(exchanges="\n".join(lines))
+
+
+def retrieval_query(question: str, clarifications: list = None) -> str:
+    """
+    The string actually used for retrieval, as distinct from the text
+    shown to the model.
+
+    The user's replies are appended, not the questions we asked them.
+    The replies are where the disambiguating terms live ("the Team
+    plan"), and they are what retrieval needs; the question we asked is
+    our own wording and only adds noise to a lexical match.
+
+    This is why the clarification loop re-retrieves instead of resuming
+    a checkpoint. Measured on the sample corpus: "What is the price?"
+    retrieves nothing at all - correctly, it is too vague to match
+    anything above the relevance floor - while "What is the price? Team
+    plan" retrieves three chunks. There is no useful retrieval state to
+    restore, so the loop recomputes it.
+    """
+    if not clarifications:
+        return question
+    answers = " ".join(
+        str(item.get("user_answer", "")).strip() for item in clarifications
+    )
+    return f"{question} {answers}".strip()
 
 
 @dataclass
@@ -199,14 +247,20 @@ def retrieve(vectorstore, question: str, k: int = None):
     return HybridRetriever(vectorstore).retrieve(question, k=k)
 
 
-def generate_answer(context: str, question: str, max_attempts: int = None) -> RAGResponse:
+def generate_answer(
+    context: str, question: str, clarifications: list = None, max_attempts: int = None
+) -> RAGResponse:
     """
     The Answerer step, on its own: given context + question, return a
     validated RAGResponse. Raises MissingAPIKeyError or RuntimeError on
     failure - callers decide how to handle that (the CLI turns it into an
     error dict; the LangGraph node turns it into a state["error"] field).
     """
-    prompt = STRUCTURED_PROMPT_TEMPLATE.format(context=context, question=question)
+    prompt = STRUCTURED_PROMPT_TEMPLATE.format(
+        context=context,
+        question=question,
+        clarifications=format_clarifications(clarifications or []),
+    )
     llm = get_llm()  # raises MissingAPIKeyError if not configured
     return invoke_structured(
         llm,
@@ -217,7 +271,13 @@ def generate_answer(context: str, question: str, max_attempts: int = None) -> RA
     )
 
 
-def answer_question(vectorstore, question: str, k: int = None, max_attempts: int = None) -> dict:
+def answer_question(
+    vectorstore,
+    question: str,
+    k: int = None,
+    max_attempts: int = None,
+    clarifications: list = None,
+) -> dict:
     """
     Full non-graph pipeline, kept as the CLI's simple path and as a
     baseline to compare the LangGraph version against. Returns a dict
@@ -225,7 +285,9 @@ def answer_question(vectorstore, question: str, k: int = None, max_attempts: int
     "error" - callers should always check "error" before touching
     "structured".
     """
-    retrieved_docs = retrieve(vectorstore, question, k=k)
+    retrieved_docs = retrieve(
+        vectorstore, retrieval_query(question, clarifications), k=k
+    )
     refs = build_source_refs(retrieved_docs)
     context = format_context(refs)
 
@@ -241,7 +303,9 @@ def answer_question(vectorstore, question: str, k: int = None, max_attempts: int
     }
 
     try:
-        parsed = generate_answer(context, question, max_attempts=max_attempts)
+        parsed = generate_answer(
+            context, question, clarifications=clarifications, max_attempts=max_attempts
+        )
     except (MissingAPIKeyError, RuntimeError) as e:
         result["error"] = str(e)
         return result

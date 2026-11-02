@@ -147,11 +147,17 @@ def test_bm25_on_an_empty_store_returns_nothing():
 # open". That behaviour is itself asserted below, but it means a fake
 # store can't be used to exercise a gate *decision*.
 
-def gate(dense=None, lexical=None, threshold=0.4, dense_available=True):
+def gate(dense=None, lexical=None, threshold=0.4, dense_available=True,
+         rerank=None, rerank_threshold=0.05):
     retriever = HybridRetriever.__new__(HybridRetriever)
     retriever.min_relevance = threshold
+    retriever.rerank_min_score = rerank_threshold
     return retriever._passes_gate(
-        "k", {"k": dense} if dense is not None else {}, {"k": lexical or 0.0}, dense_available
+        "k",
+        {"k": dense} if dense is not None else {},
+        {"k": lexical or 0.0},
+        dense_available,
+        {"k": rerank} if rerank is not None else {},
     )
 
 
@@ -189,6 +195,27 @@ def test_gate_fails_open_on_an_out_of_range_score():
 
 def test_gate_disabled_by_zero_threshold():
     assert gate(dense=0.0, lexical=0.0, threshold=0.0) is True
+
+
+def test_rerank_score_decides_alone_when_present():
+    # The cross-encoder scored this pair directly, so the weaker proxies
+    # don't get to overrule it in either direction.
+    assert gate(dense=0.99, lexical=0.99, rerank=0.001) is False
+    assert gate(dense=0.01, lexical=0.0, rerank=0.9) is True
+
+
+def test_rerank_failure_falls_back_to_the_other_signals():
+    # _rerank_scores returns {} when the model is unavailable, which must
+    # degrade to the previous behaviour rather than reject everything.
+    assert gate(dense=0.7, rerank=None) is True
+    assert gate(dense=0.12, rerank=None) is False
+
+
+def test_reranker_is_off_in_tests_by_default():
+    # Guards the offline promise: conftest.py disables it suite-wide.
+    from src.config import config
+    assert config.RERANK is False
+    assert HybridRetriever(make_store()).rerank is False
 
 
 # --- retriever wiring ---

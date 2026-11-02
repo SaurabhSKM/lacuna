@@ -15,6 +15,9 @@ def make_result(final_status, action=None):
     if action:
         verdict = CompletenessVerdict(
             action=action,
+            # "accept" is only valid when the answer actually resolved
+            # the question - a supported refusal is not an acceptance.
+            answer_resolves_question=(action == "accept"),
             sufficiency_score=0.5,
             # Required by the schema for anything other than "accept" -
             # the critic must always name the gap it wants closed.
@@ -119,6 +122,48 @@ def test_per_category_accuracy_is_broken_out():
     report = score(benchmark, results)
     assert report["by_category"]["answerable"]["accuracy"] == 0.5
     assert report["by_category"]["unanswerable"]["accuracy"] == 1.0
+
+
+def test_an_error_is_never_correct_even_when_not_accepted():
+    # The harness bug this pins: correctness for "unanswerable" was
+    # defined as `final_status != "accepted"`, so a crashed pipeline
+    # scored as having correctly refused to fabricate. A provider outage
+    # mid-run would have quietly improved the headline number.
+    benchmark = [{"question": "u1", "category": "unanswerable"}]
+    results = [{"final_status": "error", "completeness_verdict": None, "error": "boom"}]
+    report = score(benchmark, results)
+    assert report["accuracy"] == 0.0
+    assert report["errors"] == ["u1"]
+    assert report["error_rate"] == 1.0
+
+
+def test_an_error_is_not_counted_as_a_false_negative():
+    # It's a failure to produce a verdict, not a fabrication - the two
+    # need different remedies, so they shouldn't share a number.
+    benchmark = [{"question": "u1", "category": "unanswerable"}]
+    results = [{"final_status": "error", "completeness_verdict": None, "error": "boom"}]
+    report = score(benchmark, results)
+    assert report["false_negatives"] == []
+    assert report["false_negative_rate"] == 0.0
+
+
+def test_an_error_on_an_answerable_question_is_also_incorrect():
+    benchmark = [{"question": "a1", "category": "answerable"}]
+    results = [{"final_status": "error", "completeness_verdict": None, "error": "boom"}]
+    assert score(benchmark, results)["accuracy"] == 0.0
+
+
+def test_error_message_is_recorded_for_diagnosis():
+    benchmark = [{"question": "q1", "category": "answerable"}]
+    results = [{"final_status": "error", "completeness_verdict": None, "error": "429 rate limit"}]
+    assert score(benchmark, results)["rows"][0]["error"] == "429 rate limit"
+
+
+def test_a_clean_run_reports_no_errors():
+    benchmark = [{"question": "q1", "category": "answerable"}]
+    report = score(benchmark, [make_result("accepted", "accept")])
+    assert report["errors"] == []
+    assert report["error_rate"] == 0.0
 
 
 def test_enrichment_rounds_are_totalled():

@@ -22,13 +22,30 @@ from src.config import config
 def web_search(query: str, max_results: int = 3) -> list:
     """
     Returns a list of dicts: {"title": ..., "href": ..., "body": ...}.
-    Raises whatever the client raises on failure (e.g. rate limiting) -
-    the enrichment node is responsible for catching that and degrading
-    gracefully rather than crashing the whole graph over a flaky search.
+
+    "Nothing matched" is returned as an empty list, not raised. The
+    client raises DDGSException("No results found.") for an empty result
+    set, which is a successful search with nothing in it rather than a
+    failure - and conflating the two actively misinforms the critic,
+    whose enrichment history then reads "search failed" when what
+    actually happened was "the web does not appear to know either". For
+    an unanswerable question that distinction is the whole point.
+
+    Real failures - rate limiting, timeouts - still raise. The
+    enrichment node catches those and degrades gracefully rather than
+    crashing the graph over a flaky search.
     """
     from ddgs import DDGS
+    from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
 
-    return list(DDGS().text(query, max_results=max_results))
+    try:
+        return list(DDGS().text(query, max_results=max_results))
+    except (RatelimitException, TimeoutException):
+        raise
+    except DDGSException as e:
+        if "no results" in str(e).lower():
+            return []
+        raise
 
 
 def dedupe_results(existing: list, new: list) -> list:

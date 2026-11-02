@@ -78,7 +78,10 @@ def describe_step(node_name: str, delta: dict) -> str:
         return "[Orchestrator] Answer accepted."
 
     if node_name == "clarification_needed":
-        return "[Orchestrator] Question is ambiguous - needs clarification from the user."
+        return (
+            "[Orchestrator] Question is ambiguous - asking the user: "
+            f"{delta.get('clarification_request', '(no specific request)')}"
+        )
 
     if node_name == "max_iterations_reached":
         return "[Orchestrator] Hit the enrichment iteration cap - returning best-effort answer."
@@ -96,6 +99,18 @@ def main():
     parser.add_argument(
         "--show-retrieval", action="store_true", help="Print per-chunk retrieval scores"
     )
+    parser.add_argument(
+        "--clarify",
+        action="append",
+        default=[],
+        metavar="ANSWER",
+        help="Pre-supply a clarification answer (repeatable), instead of being prompted",
+    )
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Don't ask interactively when the question is ambiguous; just report it",
+    )
     args = parser.parse_args()
 
     vectorstore = load_vectorstore(args.persist)
@@ -105,13 +120,43 @@ def main():
     print("LIVE PROGRESS")
     print("=" * 60)
 
-    state = initial_state(args.question)
-    # One parent trace for the whole question, same as the API path.
-    with tracing.question_trace(args.question):
-        for update in app.stream(dict(state), stream_mode="updates"):
-            for node_name, delta in update.items():
-                state.update(delta)
-                print(describe_step(node_name, delta))
+    # Answers queued on the command line are consumed first, so a
+    # clarification run can be scripted and tested non-interactively.
+    queued = list(args.clarify)
+    clarifications = []
+
+    while True:
+        state = initial_state(args.question, clarifications)
+        with tracing.question_trace(args.question):
+            for update in app.stream(dict(state), stream_mode="updates"):
+                for node_name, delta in update.items():
+                    state.update(delta)
+                    print(describe_step(node_name, delta))
+
+        if state.get("final_status") != "needs_clarification":
+            break
+
+        request = state.get("clarification_request") or "Could you be more specific?"
+        if queued:
+            reply = queued.pop(0)
+            print(f"\n[You] (from --clarify) {reply}")
+        elif args.no_prompt or not sys.stdin.isatty():
+            break
+        else:
+            try:
+                reply = input(f"\n[Lacuna asks] {request}\n[You] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n(no clarification given)")
+                break
+            if not reply:
+                break
+
+        clarifications.append({"question_asked": request, "user_answer": reply})
+        print("\n" + "-" * 60)
+        print(f"RESUMING with clarification {len(clarifications)}/"
+              f"{config.MAX_CLARIFICATIONS} - re-retrieving on the clarified question")
+        print("-" * 60)
+
     tracing.flush()
 
     if args.show_retrieval and state.get("retrieval_debug", {}).get("scores"):
@@ -131,6 +176,17 @@ def main():
 
     if state.get("error"):
         print(f"[Error: {state['error']}]")
+        return
+
+    if state.get("clarifications"):
+        print("\nClarifications used:")
+        for turn in state["clarifications"]:
+            print(f"  asked: {turn['question_asked']}")
+            print(f"  you  : {turn['user_answer']}")
+
+    if state["final_status"] == "needs_clarification":
+        print(f"\nStill needs clarification: {state.get('clarification_request')}")
+        print("Re-run with --clarify \"your answer\" to continue.")
         return
 
     answer = state.get("structured_answer")

@@ -79,6 +79,22 @@ def _classify(error: Exception) -> str:
     return "validation"
 
 
+def _sampling_kwargs() -> dict:
+    """
+    Sampling parameters, omitted entirely when LLM_TEMPERATURE is unset.
+
+    Models that fix their own sampling - gemini-*-flash-lite and the
+    reasoning models - warn on every call if a temperature is sent, and
+    the warning is correct: the value is discarded. Low temperature is
+    the right default for this project (the Answerer and the critic both
+    want determinism, not variety), so it stays set by default and can
+    be turned off per deployment.
+    """
+    if config.LLM_TEMPERATURE is None:
+        return {}
+    return {"temperature": config.LLM_TEMPERATURE}
+
+
 def get_llm():
     provider = config.LLM_PROVIDER.lower()
 
@@ -93,7 +109,7 @@ def get_llm():
         return ChatGroq(
             api_key=config.GROQ_API_KEY,
             model=config.GROQ_MODEL,
-            temperature=config.LLM_TEMPERATURE,
+            **_sampling_kwargs(),
         )
 
     if provider == "gemini":
@@ -108,7 +124,7 @@ def get_llm():
         return ChatGoogleGenerativeAI(
             google_api_key=config.GOOGLE_API_KEY,
             model=config.GEMINI_MODEL,
-            temperature=config.LLM_TEMPERATURE,
+            **_sampling_kwargs(),
         )
 
     if provider == "stub":
@@ -237,9 +253,17 @@ class _StubStructured:
             )
 
         if self.schema is CompletenessVerdict:
-            if self._AMBIGUOUS.match(question):
+            # A question the user has already clarified is no longer
+            # ambiguous. Without this the stub would ask for the same
+            # clarification on every turn and the loop could never
+            # terminate - which is exactly the real failure the
+            # clarification history exists to prevent, so the stub has
+            # to model it.
+            already_clarified = "User replied:" in prompt
+            if self._AMBIGUOUS.match(question) and not already_clarified:
                 return CompletenessVerdict(
                     action="ask_user",
+                    answer_resolves_question=False,
                     sufficiency_score=0.2,
                     gap_description="[stub] the question does not say which plan or product is meant",
                     reasoning="[stub] question is underspecified",
@@ -247,11 +271,13 @@ class _StubStructured:
             if overlap > 0.6:
                 return CompletenessVerdict(
                     action="accept",
+                    answer_resolves_question=True,
                     sufficiency_score=round(min(0.95, overlap), 2),
                     reasoning="[stub] context covers the question terms",
                 )
             return CompletenessVerdict(
                 action="enrich",
+                answer_resolves_question=False,
                 sufficiency_score=round(overlap, 2),
                 gap_description=f"[stub] specific details about: {question[:80]}",
                 reasoning="[stub] context only partially covers the question",

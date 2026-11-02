@@ -43,6 +43,7 @@ def score(benchmark: list, results: list) -> dict:
     """
     correct = 0
     false_negatives = []  # unanswerable questions that still ended up "accepted"
+    errored = []
     rows = []
 
     unanswerable_total = sum(1 for item in benchmark if item["category"] == "unanswerable")
@@ -53,7 +54,19 @@ def score(benchmark: list, results: list) -> dict:
         verdict = result.get("completeness_verdict")
         actual_action = verdict.action if verdict else None
 
-        if category == "answerable":
+        if final_status == "error":
+            # An error is never a correct outcome, in any category.
+            #
+            # This used to score as a success for "unanswerable", because
+            # correctness there was defined as `final_status !=
+            # "accepted"` - so a crashed pipeline counted as having
+            # correctly declined to fabricate. A metric that credits its
+            # own failures is worse than no metric: a provider outage
+            # mid-run would quietly improve the headline number. Two
+            # questions hit this on a real run, which is how it surfaced.
+            is_correct = False
+            errored.append(item["question"])
+        elif category == "answerable":
             is_correct = final_status == "accepted"
         elif category == "unanswerable":
             is_correct = final_status != "accepted"
@@ -72,6 +85,9 @@ def score(benchmark: list, results: list) -> dict:
             "critic_action": actual_action,
             "iteration_count": result.get("iteration_count", 0),
             "retrieved": len(result.get("retrieved_docs") or []),
+            # Kept so a failed run is diagnosable from the report alone,
+            # rather than only from whatever was on the terminal.
+            "error": result.get("error"),
             "correct": is_correct,
         })
 
@@ -94,6 +110,11 @@ def score(benchmark: list, results: list) -> dict:
         "accuracy": accuracy,
         "false_negative_rate": false_negative_rate,
         "false_negatives": false_negatives,
+        # Surfaced rather than buried: a run with a high error count is
+        # not a measurement of routing quality, whatever its accuracy
+        # happens to say.
+        "errors": errored,
+        "error_rate": len(errored) / len(benchmark) if benchmark else 0.0,
         "by_category": by_category,
         "enrichment_rounds": sum(row["iteration_count"] for row in rows),
         "rows": rows,
@@ -132,6 +153,17 @@ def main():
     print(f"Overall routing accuracy: {report['accuracy']:.1%}")
     print(f"False-negative rate (unanswerable confidently accepted): {report['false_negative_rate']:.1%}")
     print(f"Total enrichment rounds spent: {report['enrichment_rounds']}")
+    if report["errors"]:
+        print(
+            f"\n⚠ {len(report['errors'])} question(s) ended in a pipeline ERROR "
+            f"({report['error_rate']:.1%}). These count as incorrect, and a run "
+            f"with errors is not a clean measurement:"
+        )
+        for row in report["rows"]:
+            if row["final_status"] == "error":
+                print(f"  - {row['question']}")
+                print(f"      {row.get('error') or '(no error message recorded)'}")
+    print()
     for category, bucket in sorted(report["by_category"].items()):
         print(f"  {category:14s} {bucket['correct']}/{bucket['total']} ({bucket['accuracy']:.0%})")
 

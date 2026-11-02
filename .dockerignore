@@ -1,9 +1,72 @@
-venv/
-__pycache__/
-*.pyc
+# Keeps the build context small and keeps secrets out of the image.
+#
+# The Dockerfile COPYs only src/, scripts/ and data/sample_docs/, so most
+# of this is belt-and-braces - but the build context is uploaded to the
+# daemon in full before any COPY runs, so an un-ignored .venv means
+# shipping 650MB on every build.
+
+# Secrets: never bake a key into an image layer.
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+
+# Vector store: the image builds its own index, or mounts a volume.
 chroma_db/
+chroma/
+chroma.sqlite3
+chroma.sqlite3-*
+*.sqlite3
+
+# Model weights: the Dockerfile fetches these itself, into /opt/fastembed.
+fastembed_cache/
+.fastembed_cache/
+models/
+.cache/
+
+# Runtime data
 data/uploads/
-.git/
-.pytest_cache/
+data/feedback.jsonl
+
+# Not needed at runtime. Tests and eval run in CI and locally, against
+# the source tree rather than the image.
+tests/
+eval/
+.github/
+pytest.ini
+requirements-eval.txt
+README.md
+LICENSE
+render.yaml
+docker-compose.yml
+Dockerfile
+
+# Python, caches, logs, editors
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
 *.egg-info/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+*.log
+.vscode/
+.idea/
+.ipynb_checkpoints/
+.DS_Store
+.git/
+.gitignore

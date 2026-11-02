@@ -1,0 +1,48 @@
+Aria Cloud Storage - Data Handling and Retention
+
+Storage regions
+
+Customer file data is stored in one of two regions, selected when the
+organisation is created: eu-west (Dublin) or us-east (Virginia). The region
+cannot be changed after creation; moving an organisation between regions
+requires a migration performed by Aria support and is available only to
+Enterprise customers. Account metadata such as user names and email
+addresses is replicated to both regions for authentication purposes.
+
+Retention and deletion
+
+Deleted files are moved to a recoverable trash area for 30 days on Starter
+and Team plans, and for 90 days on the Enterprise plan. After that window
+the file is purged from primary storage within 24 hours and from backups
+within 35 days. A deletion request submitted through the admin console
+covers both primary storage and backups, and Aria issues a written
+confirmation once the backup purge completes.
+
+Account closure
+
+When an organisation closes its account, data remains available in a
+read-only state for 30 days, after which deletion begins automatically.
+Customers may request immediate deletion instead, which skips the read-only
+period.
+
+Backups
+
+Primary storage is replicated synchronously within a region across three
+availability zones. A separate daily backup is retained for 35 days.
+Point-in-time restore to any hour within the last seven days is available
+on the Enterprise plan. Starter and Team customers may request a restore
+from the most recent daily backup through support.
+
+Regulatory posture
+
+Aria processes personal data as a processor under the EU General Data
+Protection Regulation and offers a data processing addendum to all
+customers on request. Aria also honours consumer rights requests under the
+California Consumer Privacy Act. Aria publishes a list of subprocessors and
+notifies customers 30 days before adding a new one.
+
+Law enforcement requests
+
+Aria requires valid legal process for any disclosure of customer content,
+notifies the affected customer unless legally prohibited, and publishes
+aggregate request counts twice a year in a transparency report.

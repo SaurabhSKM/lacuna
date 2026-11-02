@@ -1,29 +1,82 @@
 """
 Ingestion pipeline: raw files -> chunks -> embeddings -> Chroma vector store.
 
-This is the "unglamorous but essential" part of RAG. Three separate ideas
-live in this file, kept as separate functions on purpose so each is easy
-to test and reason about independently:
+This is the "unglamorous but essential" part of RAG. The stages are kept
+as separate functions on purpose so each is easy to test and reason about
+independently:
 
-  1. load_documents   - read files off disk into LangChain Document objects
+  1. load_documents    - read files off disk into LangChain Document objects
   2. chunk_documents   - split long documents into retrieval-sized pieces
-  3. build_vectorstore  - embed the chunks and persist them to Chroma
+  3. build_vectorstore - embed the chunks and persist them to Chroma
+
+The loaders are local functions rather than langchain_community's
+DirectoryLoader / TextLoader / PyPDFLoader. Those three classes were the
+only thing the project used langchain-community for, and "glob a
+directory, read text, read a PDF with pypdf" is a smaller amount of code
+than the dependency was worth. It also means a PDF page number lands in
+the metadata in the shape this project actually wants, rather than the
+shape the loader happened to pick.
 """
 from pathlib import Path
 
-from langchain_community.document_loaders import (
-    DirectoryLoader,
-    TextLoader,
-    PyPDFLoader,
-)
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_chroma import Chroma
 
 from src.config import config
+from src.embeddings import get_embedding_model
+
+TEXT_EXTENSIONS = (".txt", ".md")
+SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS + (".pdf",)
 
 
-def load_documents(docs_dir: str):
+def _load_text_file(path: Path) -> list:
+    # errors="replace" rather than strict: one byte of bad encoding in a
+    # 200-page export shouldn't abort the whole ingestion run.
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if not text.strip():
+        return []
+    return [Document(page_content=text, metadata={"source": str(path)})]
+
+
+def _load_pdf_file(path: Path) -> list:
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path))
+    docs = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        if not text.strip():
+            continue  # scanned/image-only page: nothing to embed
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={"source": str(path), "page": page_number},
+            )
+        )
+    return docs
+
+
+def load_file(file_path) -> list:
+    """Load one file by extension. Returns a list of Documents (a PDF
+    yields one per page with text on it)."""
+    path = Path(file_path)
+    ext = path.suffix.lower()
+    if ext in TEXT_EXTENSIONS:
+        return _load_text_file(path)
+    if ext == ".pdf":
+        return _load_pdf_file(path)
+    raise ValueError(
+        f"Unsupported file extension '{ext}'. "
+        f"Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
+    )
+
+
+# Kept under its original name: the /upload endpoint and the tests call it.
+load_single_document = load_file
+
+
+def load_documents(docs_dir: str) -> list:
     """
     Load every .txt, .md, and .pdf file under docs_dir into a list of
     LangChain Document objects (each has .page_content and .metadata).
@@ -33,55 +86,32 @@ def load_documents(docs_dir: str):
         raise FileNotFoundError(f"Docs directory not found: {docs_dir}")
 
     documents = []
+    skipped = []
+    # sorted() so ingestion order - and therefore chunk ids and BM25
+    # ordering - is reproducible rather than filesystem-dependent.
+    for path in sorted(docs_path.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        try:
+            documents.extend(load_file(path))
+        except Exception as e:
+            # One unreadable file shouldn't sink the whole run; report it
+            # and carry on, so a 500-document ingestion isn't lost to a
+            # single corrupt PDF.
+            skipped.append(f"{path.name}: {e}")
 
-    # Plain text / markdown
-    text_loader = DirectoryLoader(
-        docs_dir,
-        glob="**/*.txt",
-        loader_cls=TextLoader,
-        loader_kwargs={"encoding": "utf-8"},
-        show_progress=False,
-    )
-    documents.extend(text_loader.load())
-
-    md_loader = DirectoryLoader(
-        docs_dir,
-        glob="**/*.md",
-        loader_cls=TextLoader,
-        loader_kwargs={"encoding": "utf-8"},
-        show_progress=False,
-    )
-    documents.extend(md_loader.load())
-
-    # PDFs need their own loader
-    for pdf_path in docs_path.glob("**/*.pdf"):
-        documents.extend(PyPDFLoader(str(pdf_path)).load())
+    if skipped:
+        print(f"Skipped {len(skipped)} unreadable file(s):")
+        for s in skipped:
+            print(f"  - {s}")
 
     if not documents:
         raise ValueError(
-            f"No .txt, .md, or .pdf files found in {docs_dir}. "
+            f"No readable .txt, .md, or .pdf files found in {docs_dir}. "
             "Nothing to ingest."
         )
 
     return documents
-
-
-def load_single_document(file_path: str):
-    """
-    Load exactly one file (used by the /upload API endpoint, where files
-    arrive one at a time). Kept separate from load_documents() above,
-    which is built around DirectoryLoader for the bulk CLI ingestion
-    path - different enough mechanics that unifying them would add
-    complexity without removing any.
-    """
-    ext = Path(file_path).suffix.lower()
-    if ext in (".txt", ".md"):
-        return TextLoader(file_path, encoding="utf-8").load()
-    if ext == ".pdf":
-        return PyPDFLoader(file_path).load()
-    raise ValueError(
-        f"Unsupported file extension '{ext}'. Supported: .txt, .md, .pdf"
-    )
 
 
 def chunk_documents(documents):
@@ -98,25 +128,15 @@ def chunk_documents(documents):
     return splitter.split_documents(documents)
 
 
-def get_embedding_model():
-    """
-    Local embedding model - ONNX runtime, CPU-only, no API key, no
-    PyTorch dependency. First call downloads the model weights (~80MB)
-    once and caches them.
-    """
-    return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-
-
 def build_vectorstore(chunks, persist_dir: str):
     """
     Embed all chunks and persist them to a Chroma collection on disk.
     Running this again with the same persist_dir will add to the
-    existing collection (fine for now; de-duplication comes later).
+    existing collection.
     """
-    embeddings = get_embedding_model()
     vectorstore = Chroma.from_documents(
         documents=chunks,
-        embedding=embeddings,
+        embedding=get_embedding_model(),
         persist_directory=persist_dir,
     )
     return vectorstore
@@ -124,10 +144,9 @@ def build_vectorstore(chunks, persist_dir: str):
 
 def load_vectorstore(persist_dir: str):
     """Reopen an existing Chroma collection for querying."""
-    embeddings = get_embedding_model()
     return Chroma(
         persist_directory=persist_dir,
-        embedding_function=embeddings,
+        embedding_function=get_embedding_model(),
     )
 
 

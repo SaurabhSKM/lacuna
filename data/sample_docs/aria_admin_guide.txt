@@ -1,0 +1,51 @@
+Aria Cloud Storage - Administrator Guide
+
+Roles
+
+Aria defines four roles. An Owner has full control including billing and
+account closure, and an organisation must always have at least one. An
+Admin can manage users, folders, and settings but cannot change billing or
+close the account. A Member can create and share content within the
+permissions granted to them. A Guest can only access content explicitly
+shared with them and cannot create top-level folders.
+
+User provisioning
+
+Users may be invited individually by email, imported in bulk from a CSV
+file, or provisioned automatically. Automatic provisioning uses SCIM 2.0
+and is available on the Enterprise plan only; it supports create, update,
+and deactivate operations, and is tested against Okta, Entra ID, and
+OneLogin. A SCIM deactivation places the user in a suspended state rather
+than deleting them, so their file ownership is preserved until an admin
+reassigns it.
+
+Audit logs
+
+Every administrative action, sign-in attempt, and file permission change is
+written to the audit log. Logs are retained for 90 days on the Team plan
+and 400 days on the Enterprise plan; the Starter plan does not include
+audit logging. Logs may be exported as CSV from the console or streamed to
+an external SIEM through the audit log API, which is Enterprise-only.
+
+Device management
+
+Admins can view every device with an active session and revoke a session
+remotely. Revocation takes effect at the device's next sync, typically
+within 60 seconds. Enterprise admins may additionally require that files
+be removed from local storage when a session is revoked, which the desktop
+client enforces on its next start.
+
+Sharing controls
+
+An admin may set an organisation-wide default for new share links:
+anyone-with-the-link, organisation-only, or named-recipients-only. Link
+expiry may be forced to a maximum number of days. External sharing can be
+restricted to an allowlist of email domains. These settings apply to new
+links only and do not retroactively change links already created.
+
+Storage quotas
+
+Quotas are enforced per user by default. Team organisations may instead
+enable a shared pool, in which all members draw from one organisation-wide
+allowance. Switching between per-user and pooled quotas is permitted once
+per billing period.

@@ -13,7 +13,14 @@ from src.schemas import CompletenessVerdict
 def make_result(final_status, action=None):
     verdict = None
     if action:
-        verdict = CompletenessVerdict(action=action, sufficiency_score=0.5, reasoning="test")
+        verdict = CompletenessVerdict(
+            action=action,
+            sufficiency_score=0.5,
+            # Required by the schema for anything other than "accept" -
+            # the critic must always name the gap it wants closed.
+            gap_description=None if action == "accept" else "a specific missing figure",
+            reasoning="test",
+        )
     return {"final_status": final_status, "completeness_verdict": verdict}
 
 
@@ -93,3 +100,28 @@ def test_empty_benchmark_does_not_crash():
     assert report["accuracy"] == 0.0
     assert report["false_negative_rate"] == 0.0
     assert report["rows"] == []
+    assert report["by_category"] == {}
+
+
+def test_per_category_accuracy_is_broken_out():
+    # A single accuracy number hides which category regressed, and the
+    # three fail in completely different ways.
+    benchmark = [
+        {"question": "a1", "category": "answerable"},
+        {"question": "a2", "category": "answerable"},
+        {"question": "u1", "category": "unanswerable"},
+    ]
+    results = [
+        make_result("accepted", "accept"),
+        make_result("needs_enrichment_capped", "enrich"),  # wrong
+        make_result("needs_enrichment_capped", "enrich"),
+    ]
+    report = score(benchmark, results)
+    assert report["by_category"]["answerable"]["accuracy"] == 0.5
+    assert report["by_category"]["unanswerable"]["accuracy"] == 1.0
+
+
+def test_enrichment_rounds_are_totalled():
+    benchmark = [{"question": "q1", "category": "answerable"}]
+    results = [{**make_result("accepted", "accept"), "iteration_count": 2}]
+    assert score(benchmark, results)["enrichment_rounds"] == 2

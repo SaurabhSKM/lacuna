@@ -1,7 +1,99 @@
-venv/
-__pycache__/
-*.pyc
+# --- Secrets -----------------------------------------------------------
+# .env.example is the tracked template and must survive the .env* rule
+# below, so it's re-included explicitly.
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Virtual environments ----------------------------------------------
+# Several names because the README says `venv` and the tooling defaults
+# to `.venv`, and one of these is ~650MB of installed wheels - by far the
+# largest thing that can be committed here by accident.
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+.python-version
+
+# --- Vector store ------------------------------------------------------
+# ./chroma_db is the default persist directory, but --persist takes any
+# path, so the files Chroma actually writes are ignored by name too:
+# a sqlite catalogue plus one directory of HNSW segment files per
+# collection. data_level0.bin is the embedding matrix and grows with the
+# corpus - it's the file that would quietly turn into hundreds of MB.
 chroma_db/
+chroma/
+chroma.sqlite3
+chroma.sqlite3-*
+data_level0.bin
+header.bin
+length.bin
+link_lists.bin
+*.sqlite3
+
+# --- Model weights -----------------------------------------------------
+# fastembed defaults to the system temp directory, so this is defensive:
+# it only bites if FASTEMBED_CACHE_PATH is pointed somewhere local, which
+# is a reasonable thing to do and would drop ~80MB of ONNX weights into
+# the tree.
+fastembed_cache/
+.fastembed_cache/
+models/
+.cache/
+*.onnx
+
+# --- Runtime data ------------------------------------------------------
+# Uploaded documents and user feedback are other people's content; they
+# belong in the deployment, never in the repository.
+data/uploads/
+data/feedback.jsonl
+
+# --- Eval output -------------------------------------------------------
+# run_eval.py --output and retrieval_eval.py --output. Note that
+# requirements.lock is deliberately NOT ignored: a lockfile is an
+# artifact you commit on purpose.
+results.json
+retrieval.json
+eval_results/
+*.results.json
+
+# --- Python ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
 *.egg-info/
+.eggs/
+
+# --- Test and lint caches ----------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# --- Logs --------------------------------------------------------------
+*.log
+
+# --- Editors and OS ----------------------------------------------------
+# .vscode/settings.json is tracked on purpose: it tells the editor not to
+# index or watch a local virtualenv, which is shared project hygiene
+# rather than one person's preference. Everything else under .vscode/ is
+# personal and stays out.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+.ipynb_checkpoints/
 .DS_Store
+Thumbs.db
+desktop.ini

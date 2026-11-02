@@ -1,0 +1,43 @@
+Aria Cloud Storage - Release Notes
+
+Release 4.3 (current)
+
+Adds point-in-time restore for the Enterprise plan, covering any hour
+within the previous seven days. Reduces desktop client memory use on
+libraries of more than 500,000 files. Adds the X-RateLimit-Reset header to
+every API response. Fixes a defect in which a shared folder moved by its
+owner could briefly disappear from a collaborator's view.
+
+Release 4.2
+
+Introduces SCIM 2.0 automatic provisioning on the Enterprise plan. Extends
+audit log retention on the Enterprise plan from 90 to 400 days. Adds the
+Microsoft Teams channel tab. Fixes a defect in which selective sync could
+re-download a deselected folder after a client upgrade.
+
+Release 4.1
+
+Adds hardware security key support using FIDO2 on the Enterprise plan.
+Adds the shared storage pool option for Team organisations. Raises the
+single-request upload limit from 50 MB to 100 MB. Deprecates the legacy
+WebDAV gateway, which was withdrawn later the same year.
+
+Release 4.0
+
+Migrates all customers to the v2 REST API and withdraws v1. Rebuilds the
+admin console. Adds the Guest role. Changes the default share link setting
+for new organisations from anyone-with-the-link to organisation-only;
+existing organisations keep their prior default.
+
+Known issues in 4.3
+
+Offline editing conflicts between more than five simultaneous editors still
+require manual resolution by an admin. The Terraform provider does not yet
+manage webhook endpoints. Point-in-time restore cannot be initiated from
+the mobile apps.
+
+Upcoming
+
+ISO 27001 certification remains on the roadmap without a committed date.
+Webhook management in the Terraform provider is planned. No other
+commitments are published.

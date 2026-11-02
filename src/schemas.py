@@ -6,9 +6,17 @@ completeness or routed by downstream logic. By forcing the LLM through
 this schema, an "I'm not sure" becomes a machine-readable signal
 (confidence + missing_info) instead of buried, easy-to-miss hedging
 language inside a paragraph.
+
+The constraints here are load-bearing, not decoration. A field the
+schema merely *describes* as required is a suggestion; a field a
+validator rejects is a contract, and because every LLM call goes through
+llm.invoke_structured(), a rejection is automatically re-prompted with
+the validation error attached. So a constraint expressed here turns into
+a self-correcting behaviour for free.
 """
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class RAGResponse(BaseModel):
@@ -52,7 +60,8 @@ class RAGResponse(BaseModel):
             "The numeric IDs (e.g. 1, 2, 3) of the [Source N] blocks in the "
             "context that were actually used to build the answer. Only "
             "include sources you actually relied on, not every source you "
-            "were given."
+            "were given. Web results are numbered in the same sequence as "
+            "document chunks - cite them the same way."
         ),
     )
 
@@ -87,7 +96,7 @@ class CompletenessVerdict(BaseModel):
     gap_description: Optional[str] = Field(
         default=None,
         description=(
-            "Required if action is 'enrich' or 'ask_user'. Must name the "
+            "REQUIRED if action is 'enrich' or 'ask_user'. Must name the "
             "specific missing fact or ambiguity - not a vague restatement "
             "of the question - so it's actually useful as a search query "
             "or a clarifying question later."
@@ -97,3 +106,44 @@ class CompletenessVerdict(BaseModel):
     reasoning: str = Field(
         description="One or two sentences justifying the verdict."
     )
+
+    @model_validator(mode="after")
+    def _gap_required_for_non_accept(self):
+        """
+        'enrich' without a gap_description is the single most damaging
+        thing the critic can return: the enrichment node has nothing to
+        search for, so it falls back to re-searching the raw question -
+        which is exactly the search that already failed to help. Rejecting
+        it here means invoke_structured() re-prompts with the error, and
+        the loop gets a real search query instead of a wasted round.
+        """
+        if self.action in ("enrich", "ask_user") and not (self.gap_description or "").strip():
+            raise ValueError(
+                f"gap_description is required when action is '{self.action}': "
+                f"name the specific missing fact or the specific ambiguity."
+            )
+        return self
+
+
+class Citation(BaseModel):
+    """
+    One resolved source behind an answer.
+
+    Previously an answer's sources were a plain list of filenames, built
+    by mapping [Source N] ids to document metadata. That silently dropped
+    every web citation: the web results were numbered into the same
+    [Source N] sequence the model cites from, but the resolver only
+    indexed into the retrieved *documents*, so an id pointing at a web
+    result fell outside the range and was discarded. The answer cited a
+    source the caller never saw.
+
+    Making both kinds one type fixes that and makes provenance explicit:
+    a caller can tell at a glance whether a claim came from the uploaded
+    corpus or from the open web, which matters a great deal more for a
+    web result.
+    """
+
+    kind: Literal["document", "web"]
+    label: str  # filename for a document, page title for a web result
+    url: Optional[str] = None  # web results only
+    source_id: int  # the [Source N] number the model actually cited

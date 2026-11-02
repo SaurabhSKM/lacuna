@@ -1,0 +1,50 @@
+Aria Cloud Storage - API Reference Notes
+
+Authentication
+
+The Aria REST API authenticates with a bearer token presented in the
+Authorization header. Tokens are created in the admin console and are
+scoped to an organisation. A personal access token inherits the
+permissions of the user who created it and expires after 90 days unless
+renewed. Enterprise organisations may instead register an OAuth 2.0 client
+and use the client credentials grant, which issues tokens valid for one
+hour.
+
+Rate limits
+
+The API allows 120 requests per minute per token for Starter, 600 for Team,
+and 3000 for Enterprise. Every response carries an X-RateLimit-Remaining
+header and an X-RateLimit-Reset header giving the Unix timestamp at which
+the window resets. Exceeding the limit returns HTTP 429 with a Retry-After
+header in seconds. Clients should back off exponentially; sustained
+hammering of a rate-limited endpoint results in a temporary token
+suspension of 15 minutes.
+
+Upload endpoints
+
+Files under 100 MB may be uploaded in a single POST to /v2/files. Larger
+files must use the multipart session flow: POST /v2/upload_sessions to
+open a session, PUT each chunk of between 5 MB and 100 MB, then POST
+/v2/upload_sessions/{id}/commit. An upload session expires after 48 hours
+of inactivity and its partial data is discarded.
+
+Webhooks
+
+An organisation may register up to 10 webhook endpoints. Aria signs each
+delivery with an HMAC-SHA256 signature in the X-Aria-Signature header,
+computed over the raw request body using the webhook's signing secret.
+Deliveries are retried with exponential backoff for up to 24 hours; an
+endpoint that fails every delivery for seven consecutive days is disabled
+automatically and an email is sent to the organisation's administrators.
+
+Pagination
+
+List endpoints return a cursor in the next_cursor field. A missing or null
+next_cursor means the final page has been reached. Page size defaults to
+100 and may be set as high as 1000 with the limit parameter.
+
+Errors
+
+Errors return a JSON body with an error_code string and a human-readable
+message. Codes are stable and safe to branch on; messages are not and may
+change without notice.

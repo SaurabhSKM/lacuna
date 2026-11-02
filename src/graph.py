@@ -1,9 +1,9 @@
 """
-Phase 4: the enrichment loop is now real.
+The LangGraph state machine.
 
-Retriever runs once. Answerer -> Completeness-checker can now cycle
-through Enrichment and back to Answerer multiple times - this is a real
-graph cycle, not just a DAG - bounded by MAX_ENRICHMENT_ITERATIONS so an
+Retriever runs once. Answerer -> Completeness-checker can cycle through
+Enrichment and back to Answerer multiple times - this is a real graph
+cycle, not just a DAG - bounded by MAX_ENRICHMENT_ITERATIONS so an
 ambiguous or genuinely unanswerable question can't loop forever.
 
 Design choice: the loop goes back to Answerer, not back to Retriever.
@@ -14,9 +14,23 @@ so the loop only needs to re-run the Answerer and the Completeness-checker
 against the enlarged context, not repeat a vector search that would be
 identical to the first one.
 
-Phase 7 addition: on an ACCEPTED answer, any web sources that contributed
-to it are persisted back into the vectorstore (see make_accept_node) -
-the gap doesn't just get patched for one answer, it closes permanently.
+On an ACCEPTED answer, the web sources the answer actually cited are
+persisted back into the vectorstore (see make_accept_node) - the gap
+doesn't just get patched for one answer, it closes permanently.
+
+Two structural additions worth calling out:
+
+**Retrieval can now legitimately return nothing**, because the retriever
+gates on relevance instead of always handing back its k nearest
+neighbours. When it does, the graph skips the first Answerer and critic
+round entirely and goes straight to enrichment. Asking a model to answer
+from an empty context, then asking a second model whether that answer was
+supported, is two LLM calls to discover something already known for
+certain before either call was made.
+
+**Every terminal node resolves citations**, not just `accept`. A capped
+or best-effort answer still cites sources, and a caller who is being
+handed a flagged answer needs its provenance more than usual, not less.
 """
 from typing import TypedDict, List, Optional
 
@@ -29,39 +43,89 @@ from src import websearch
 from src import tracing
 from src.config import config
 from src.llm import MissingAPIKeyError
-from src.schemas import RAGResponse, CompletenessVerdict
+from src.retrieval import HybridRetriever
+from src.schemas import RAGResponse, CompletenessVerdict, Citation
 
 
 class GraphState(TypedDict):
     question: str
     retrieved_docs: List[Document]
-    doc_context: str          # context from the vectorstore only, set once
-    web_sources: List[dict]   # raw search results, accumulated across loops
-    full_context: str         # doc_context + formatted web_sources, rebuilt each loop
+    web_sources: List[dict]          # deduped search results, accumulated across loops
+    source_refs: List[rag.SourceRef]  # documents + web results in one numbered sequence
+    full_context: str                # rendered from source_refs, rebuilt each loop
     structured_answer: Optional[RAGResponse]
+    citations: List[Citation]
     sources: List[str]
     completeness_verdict: Optional[CompletenessVerdict]
     iteration_count: int
     enrichment_log: List[dict]
+    searched_queries: List[str]
     persisted_web_sources: int
+    retrieval_debug: dict
     final_status: str  # "accepted" | "needs_clarification" | "needs_enrichment_capped" | "error"
     error: Optional[str]
 
 
+def initial_state(question: str) -> dict:
+    """
+    The starting state, in one place.
+
+    This dict used to be written out by hand in api.py, scripts/ask_graph.py
+    and eval/run_eval.py. Three copies of a fifteen-key literal is a
+    standing trap: adding a state field means remembering all three, and
+    LangGraph won't complain about the one that was missed - the node
+    that reads it just gets a KeyError at runtime, on whichever entry
+    point was forgotten.
+    """
+    return {
+        "question": question,
+        "retrieved_docs": [],
+        "web_sources": [],
+        "source_refs": [],
+        "full_context": "",
+        "structured_answer": None,
+        "citations": [],
+        "sources": [],
+        "completeness_verdict": None,
+        "iteration_count": 0,
+        "enrichment_log": [],
+        "searched_queries": [],
+        "persisted_web_sources": 0,
+        "retrieval_debug": {},
+        "final_status": "",
+        "error": None,
+    }
+
+
+def _rebuild_context(state: GraphState, web_sources: list) -> dict:
+    """Renumber documents + web results and re-render the context."""
+    refs = rag.build_source_refs(state["retrieved_docs"], web_sources)
+    return {"source_refs": refs, "full_context": rag.format_context(refs)}
+
+
+def _citations_for(state: GraphState) -> dict:
+    """Resolve the answer's cited ids against the current source list."""
+    answer = state.get("structured_answer")
+    if not answer:
+        return {"citations": [], "sources": []}
+    citations = rag.resolve_citations(state.get("source_refs", []), answer.used_source_ids)
+    return {
+        "citations": citations,
+        "sources": [c.url or c.label for c in citations],
+    }
+
+
 # --- Nodes ---
 
-def make_retrieve_node(vectorstore):
+def make_retrieve_node(retriever: HybridRetriever):
     def retrieve_node(state: GraphState) -> dict:
-        docs = rag.retrieve(vectorstore, state["question"])
-        doc_context = rag.format_context(docs)
+        docs = retriever.retrieve(state["question"])
+        refs = rag.build_source_refs(docs)
         return {
             "retrieved_docs": docs,
-            "doc_context": doc_context,
-            "full_context": doc_context,
-            "web_sources": [],
-            "iteration_count": 0,
-            "enrichment_log": [],
-            "persisted_web_sources": 0,
+            "source_refs": refs,
+            "full_context": rag.format_context(refs),
+            "retrieval_debug": dict(retriever.last_debug),
         }
 
     return retrieve_node
@@ -82,7 +146,10 @@ def completeness_node(state: GraphState) -> dict:
     answer = state["structured_answer"]
     try:
         verdict = completeness.check_completeness(
-            state["question"], state["full_context"], answer.answer
+            state["question"],
+            state["full_context"],
+            answer.answer,
+            enrichment_log=state.get("enrichment_log", []),
         )
     except (MissingAPIKeyError, RuntimeError) as e:
         return {"error": str(e), "final_status": "error"}
@@ -91,41 +158,60 @@ def completeness_node(state: GraphState) -> dict:
 
 def enrichment_node(state: GraphState) -> dict:
     """
-    The real enrichment step. Searches the web using the critic's
-    gap_description (falling back to the raw question if none was given),
-    appends the results to the context, and increments iteration_count.
+    Searches the web for the critic's gap_description, appends any new
+    results to the context, and increments iteration_count.
+
     A failed search degrades gracefully - it still increments the
     iteration count (so the cap still protects against infinite retrying
     on a broken search) rather than crashing the graph.
+
+    The verdict can legitimately be absent here: when retrieval found
+    nothing relevant, the graph routes straight to enrichment without a
+    critic round, so there is no gap_description yet and the question
+    itself is the only available query.
     """
-    verdict = state["completeness_verdict"]
-    query = verdict.gap_description or state["question"]
+    verdict = state.get("completeness_verdict")
+    question = state["question"]
+    query = (verdict.gap_description if verdict else None) or question
     iteration = state.get("iteration_count", 0) + 1
+    searched = state.get("searched_queries", [])
 
     log_entry = {"iteration": iteration, "query": query}
 
+    # The critic is told not to repeat a query, but it's a model and may
+    # do it anyway. Re-running a byte-identical search spends an
+    # iteration to receive the results already in the context, so widen
+    # it with the original question instead - different query, and the
+    # question's own terms are the ones most likely to be missing from a
+    # narrow gap description.
+    if _normalize(query) in {_normalize(q) for q in searched}:
+        query = f"{question} {query}"
+        log_entry["query"] = query
+        log_entry["broadened"] = True
+
     try:
         results = websearch.web_search(query, max_results=config.WEB_SEARCH_RESULTS)
+        new_results = websearch.dedupe_results(state.get("web_sources", []), results)
         log_entry["num_results"] = len(results)
+        log_entry["num_new"] = len(new_results)
     except Exception as e:
         log_entry["error"] = str(e)
-        results = []
+        log_entry["num_results"] = 0
+        new_results = []
 
     tracing.log_tool_span(
-        "web_search", input_data={"query": query}, output_data={"results": results}
+        "web_search", input_data={"query": query}, output_data={"results": new_results}
     )
 
-    web_sources = state.get("web_sources", []) + results
-    num_doc_sources = len(state["retrieved_docs"])
-    web_block = websearch.format_web_results(web_sources, start_index=num_doc_sources + 1)
-    full_context = state["doc_context"] + ("\n\n" + web_block if web_block else "")
-
-    return {
+    web_sources = state.get("web_sources", []) + new_results
+    update = {
         "web_sources": web_sources,
-        "full_context": full_context,
         "iteration_count": iteration,
         "enrichment_log": state.get("enrichment_log", []) + [log_entry],
+        "searched_queries": searched + [query],
     }
+    update.update(_rebuild_context(state, web_sources))
+    return update
 
 
 def make_accept_node(vectorstore, persist_enrichment: bool = True):
@@ -139,21 +225,27 @@ def make_accept_node(vectorstore, persist_enrichment: bool = True):
     non-reproducible.
     """
     def accept_node(state: GraphState) -> dict:
-        sources = rag.resolve_sources(
-            state["retrieved_docs"], state["structured_answer"].used_source_ids
-        )
+        resolved = _citations_for(state)
         persisted = 0
         if persist_enrichment and state.get("web_sources"):
+            cited_urls = {c.url for c in resolved["citations"] if c.kind == "web" and c.url}
             persisted = websearch.persist_web_sources(
-                vectorstore, state["web_sources"], state["question"]
+                vectorstore,
+                state["web_sources"],
+                state["question"],
+                cited_urls=cited_urls,
             )
-        return {"final_status": "accepted", "sources": sources, "persisted_web_sources": persisted}
+        return {
+            "final_status": "accepted",
+            "persisted_web_sources": persisted,
+            **resolved,
+        }
 
     return accept_node
 
 
 def clarification_node(state: GraphState) -> dict:
-    return {"final_status": "needs_clarification"}
+    return {"final_status": "needs_clarification", **_citations_for(state)}
 
 
 def max_iterations_node(state: GraphState) -> dict:
@@ -163,12 +255,7 @@ def max_iterations_node(state: GraphState) -> dict:
     an honest "capped out, here's my best shot" is more useful than a
     dead end.
     """
-    sources = []
-    if state.get("structured_answer"):
-        sources = rag.resolve_sources(
-            state["retrieved_docs"], state["structured_answer"].used_source_ids
-        )
-    return {"final_status": "needs_enrichment_capped", "sources": sources}
+    return {"final_status": "needs_enrichment_capped", **_citations_for(state)}
 
 
 def error_node(state: GraphState) -> dict:
@@ -176,6 +263,20 @@ def error_node(state: GraphState) -> dict:
 
 
 # --- Routing ---
+
+def route_after_retrieval(state: GraphState) -> str:
+    """
+    Skip straight to enrichment when retrieval came back empty.
+
+    This is only reachable because the retriever gates on relevance; an
+    ungated vector search always returns k chunks. Answering from a
+    knowingly-empty context and then grading that answer costs two LLM
+    calls to establish a fact already known with certainty.
+    """
+    if not state.get("retrieved_docs"):
+        return "enrich"
+    return "answer"
+
 
 def route_after_completeness(state: GraphState) -> str:
     """
@@ -203,12 +304,24 @@ def route_after_completeness(state: GraphState) -> str:
     return "enrich"
 
 
+def _normalize(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
 # --- Graph assembly ---
 
-def build_graph(vectorstore, persist_enrichment: bool = True):
+def build_graph(vectorstore, persist_enrichment: bool = True, retriever=None):
+    """
+    `retriever` is injectable so a caller can override retrieval settings
+    (the retrieval benchmark compares a dense-only against a hybrid
+    retriever over one graph build). It defaults to a HybridRetriever
+    built once per graph, which is what keeps the BM25 index from being
+    rebuilt on every question.
+    """
+    retriever = retriever or HybridRetriever(vectorstore)
     graph = StateGraph(GraphState)
 
-    graph.add_node("retrieve", make_retrieve_node(vectorstore))
+    graph.add_node("retrieve", make_retrieve_node(retriever))
     graph.add_node("answer", answer_node)
     graph.add_node("check_completeness", completeness_node)
     graph.add_node("accept", make_accept_node(vectorstore, persist_enrichment=persist_enrichment))
@@ -222,7 +335,12 @@ def build_graph(vectorstore, persist_enrichment: bool = True):
     # tried, which is exactly what test_graph_compiles_* exists to catch.
 
     graph.set_entry_point("retrieve")
-    graph.add_edge("retrieve", "answer")
+
+    graph.add_conditional_edges(
+        "retrieve",
+        route_after_retrieval,
+        {"answer": "answer", "enrich": "enrich_step"},
+    )
     graph.add_edge("answer", "check_completeness")
 
     graph.add_conditional_edges(
@@ -245,3 +363,19 @@ def build_graph(vectorstore, persist_enrichment: bool = True):
     graph.add_edge("handle_error", END)
 
     return graph.compile()
+
+
+def run_question(app, question: str) -> dict:
+    """
+    Invoke the compiled graph for one question, inside one trace.
+
+    The trace wrapper is here rather than at each call site so that every
+    entry point - HTTP, CLI, eval - produces the same trace shape. It
+    also fixes what the README listed as a known limitation: each LLM
+    call used to become its own top-level trace, because nothing
+    established a parent span, so a single question appeared in Langfuse
+    as three unrelated traces with no way to tell which answer went with
+    which critique.
+    """
+    with tracing.question_trace(question):
+        return app.invoke(initial_state(question))

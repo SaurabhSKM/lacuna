@@ -1,0 +1,47 @@
+Aria Cloud Storage - Integrations
+
+Desktop and mobile clients
+
+The desktop client runs on Windows 10 and later, macOS 12 and later, and
+Ubuntu 22.04 and later. Selective sync lets a user choose which folders are
+materialised locally. Smart offline marks a folder as always available
+offline regardless of local disk pressure. The mobile apps support iOS 16
+and later and Android 11 and later, and cache recently opened files for
+offline reading only.
+
+Chat integrations
+
+The Slack integration posts a notification when a file in a watched folder
+changes and allows a file to be shared into a channel as an Aria link
+rather than an upload. It requires a Slack workspace admin to approve the
+app. The Microsoft Teams integration offers the same two capabilities plus
+a tab that embeds an Aria folder inside a channel. Both integrations are
+available on Team and Enterprise plans.
+
+Productivity suites
+
+Aria can open and edit Microsoft Office documents in place through the
+Office for the web integration, which requires each editing user to hold
+their own Microsoft 365 licence. Google Workspace files stored in Aria are
+treated as opaque link files; Aria does not render or edit them.
+
+Identity providers
+
+SAML 2.0 single sign-on is available on the Enterprise plan and is tested
+against Okta, Entra ID, OneLogin, and Google Workspace. Just-in-time
+provisioning may be enabled so that a successful first sign-in creates the
+user automatically. Enforcing single sign-on disables password sign-in for
+all non-Guest users in the organisation.
+
+Automation
+
+A command line tool, aria-cli, is published for Linux and macOS and wraps
+the REST API for scripted uploads and downloads. Zapier and Make
+connectors cover file-created and file-updated triggers. A Terraform
+provider manages organisation settings and SCIM configuration and is
+maintained by Aria as a community-supported project without an SLA.
+
+Deprecated integrations
+
+The legacy WebDAV gateway was withdrawn in 2024 and has no replacement.
+The v1 REST API was withdrawn in 2023; all clients must use v2.

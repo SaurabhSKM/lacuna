@@ -24,28 +24,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src import tracing
+from src.config import config
 from src.ingest import load_vectorstore
-from src.graph import build_graph
+from src.graph import build_graph, run_question
 from eval.benchmark import BENCHMARK
 
 
 def run_single(app, question: str) -> dict:
-    initial_state = {
-        "question": question,
-        "retrieved_docs": [],
-        "doc_context": "",
-        "web_sources": [],
-        "full_context": "",
-        "structured_answer": None,
-        "sources": [],
-        "completeness_verdict": None,
-        "iteration_count": 0,
-        "enrichment_log": [],
-        "persisted_web_sources": 0,
-        "final_status": "",
-        "error": None,
-    }
-    return app.invoke(initial_state)
+    return run_question(app, question)
 
 
 def score(benchmark: list, results: list) -> dict:
@@ -83,6 +70,8 @@ def score(benchmark: list, results: list) -> dict:
             "category": category,
             "final_status": final_status,
             "critic_action": actual_action,
+            "iteration_count": result.get("iteration_count", 0),
+            "retrieved": len(result.get("retrieved_docs") or []),
             "correct": is_correct,
         })
 
@@ -91,17 +80,29 @@ def score(benchmark: list, results: list) -> dict:
         len(false_negatives) / unanswerable_total if unanswerable_total else 0.0
     )
 
+    # Per-category accuracy, because the three categories fail in
+    # different ways and a single number hides which one regressed.
+    by_category = {}
+    for row in rows:
+        bucket = by_category.setdefault(row["category"], {"total": 0, "correct": 0})
+        bucket["total"] += 1
+        bucket["correct"] += int(row["correct"])
+    for bucket in by_category.values():
+        bucket["accuracy"] = bucket["correct"] / bucket["total"] if bucket["total"] else 0.0
+
     return {
         "accuracy": accuracy,
         "false_negative_rate": false_negative_rate,
         "false_negatives": false_negatives,
+        "by_category": by_category,
+        "enrichment_rounds": sum(row["iteration_count"] for row in rows),
         "rows": rows,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run the Lacuna evaluation benchmark.")
-    parser.add_argument("--persist", default="./chroma_db")
+    parser.add_argument("--persist", default=config.DEFAULT_PERSIST_DIR)
     parser.add_argument("--output", default=None, help="Optional path to save the full report as JSON")
     args = parser.parse_args()
 
@@ -113,11 +114,15 @@ def main():
     # matters more here than the self-improving behavior does.
     app = build_graph(vectorstore, persist_enrichment=False)
 
-    print(f"Running {len(BENCHMARK)} benchmark questions...\n")
+    print(
+        f"Running {len(BENCHMARK)} benchmark questions "
+        f"(provider: {config.LLM_PROVIDER})...\n"
+    )
     results = []
     for item in BENCHMARK:
         print(f"  - [{item['category']}] {item['question']}")
         results.append(run_single(app, item["question"]))
+    tracing.flush()
 
     report = score(BENCHMARK, results)
 
@@ -126,6 +131,9 @@ def main():
     print("=" * 60)
     print(f"Overall routing accuracy: {report['accuracy']:.1%}")
     print(f"False-negative rate (unanswerable confidently accepted): {report['false_negative_rate']:.1%}")
+    print(f"Total enrichment rounds spent: {report['enrichment_rounds']}")
+    for category, bucket in sorted(report["by_category"].items()):
+        print(f"  {category:14s} {bucket['correct']}/{bucket['total']} ({bucket['accuracy']:.0%})")
 
     if report["false_negatives"]:
         print("\n⚠ Questions WRONGLY accepted (hallucination risk):")

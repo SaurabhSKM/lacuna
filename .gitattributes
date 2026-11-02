@@ -1,0 +1,23 @@
+# Normalise line endings to LF in the repository.
+#
+# Everything tracked here is currently LF, and this keeps it that way.
+# Without it, a commit from a Windows checkout without core.autocrlf set
+# rewrites files to CRLF, and the diff shows every line of every file as
+# changed - which buries the actual change and makes review and `git
+# blame` useless. The evidence that this is a live risk rather than a
+# hypothetical: the dependency list this project shipped with was a pip
+# freeze taken on Windows.
+* text=auto eol=lf
+
+# Binary: never normalise, never try to diff as text.
+*.png binary
+*.jpg binary
+*.pdf binary
+*.onnx binary
+*.bin binary
+*.sqlite3 binary
+
+# Generated or vendored files, collapsed in diffs and excluded from the
+# repository's language statistics.
+requirements.lock linguist-generated=true
+data/sample_docs/** linguist-vendored=true

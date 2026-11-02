@@ -6,6 +6,14 @@ services:
     env_file:
       - .env
     volumes:
-      # Persist the vector store across container restarts, so uploaded
-      # documents survive a `docker compose down` / `up` cycle.
-      - ./chroma_db:/app/chroma_db
+      # A named volume rather than a bind mount to ./chroma_db. The image
+      # runs as a non-root user (uid 10001), and a bind-mounted host
+      # directory arrives owned by the host user, so Chroma can't write
+      # to it. Docker initialises a named volume from the image's own
+      # directory, ownership included. It still survives
+      # `docker compose down` / `up`; to inspect it from the host, run
+      # `docker compose cp lacuna:/app/chroma_db ./chroma_db`.
+      - chroma-data:/app/chroma_db
+
+volumes:
+  chroma-data:

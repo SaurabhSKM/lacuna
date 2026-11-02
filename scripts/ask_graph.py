@@ -2,6 +2,7 @@
 Usage:
     python scripts/ask_graph.py "What is the refund policy for monthly plans?"
     python scripts/ask_graph.py "Does Aria support quantum encryption?"
+    python scripts/ask_graph.py "What is the price?" --show-retrieval
 
 Uses app.stream(..., stream_mode="updates") rather than app.invoke() so
 progress prints as each node actually runs, instead of only seeing the
@@ -18,14 +19,27 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src import tracing
+from src.config import config
+from src.graph import build_graph, initial_state
 from src.ingest import load_vectorstore
-from src.graph import build_graph
 
 
 def describe_step(node_name: str, delta: dict) -> str:
     if node_name == "retrieve":
-        n = len(delta.get("retrieved_docs", []))
-        return f"[Retriever] Retrieved {n} chunk(s) from the knowledge base."
+        docs = delta.get("retrieved_docs", [])
+        debug = delta.get("retrieval_debug", {})
+        if not docs:
+            return (
+                "[Retriever] Nothing passed the relevance threshold "
+                f"({debug.get('gated_out', 0)} candidate(s) rejected). "
+                "Skipping straight to enrichment."
+            )
+        return (
+            f"[Retriever] Kept {len(docs)} chunk(s) "
+            f"(dense: {debug.get('dense', 0)}, lexical: {debug.get('lexical', 0)}, "
+            f"rejected by relevance gate: {debug.get('gated_out', 0)})."
+        )
 
     if node_name == "answer":
         if delta.get("error"):
@@ -46,9 +60,11 @@ def describe_step(node_name: str, delta: dict) -> str:
         log = delta["enrichment_log"][-1]
         if "error" in log:
             return f"[Enrichment] Round {log['iteration']}: search failed ({log['error']})."
+        note = " (query broadened: the critic repeated itself)" if log.get("broadened") else ""
         return (
             f"[Enrichment] Round {log['iteration']}: searched web for "
-            f"'{log['query']}', found {log['num_results']} result(s). Re-answering..."
+            f"'{log['query']}', found {log['num_results']} result(s), "
+            f"{log.get('num_new', 0)} new{note}. Re-answering..."
         )
 
     if node_name == "accept":
@@ -56,8 +72,8 @@ def describe_step(node_name: str, delta: dict) -> str:
         if persisted:
             return (
                 f"[Orchestrator] Answer accepted. Permanently added {persisted} "
-                f"web result(s) to the knowledge base - this gap won't need "
-                f"re-searching next time."
+                f"cited web result(s) to the knowledge base - this gap won't "
+                f"need re-searching next time."
             )
         return "[Orchestrator] Answer accepted."
 
@@ -76,37 +92,38 @@ def describe_step(node_name: str, delta: dict) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Ask Lacuna a question via the LangGraph pipeline.")
     parser.add_argument("question", help="Your question, in quotes")
-    parser.add_argument("--persist", default="./chroma_db", help="Vector store directory")
+    parser.add_argument("--persist", default=config.DEFAULT_PERSIST_DIR, help="Vector store directory")
+    parser.add_argument(
+        "--show-retrieval", action="store_true", help="Print per-chunk retrieval scores"
+    )
     args = parser.parse_args()
 
     vectorstore = load_vectorstore(args.persist)
     app = build_graph(vectorstore)
 
-    initial_state = {
-        "question": args.question,
-        "retrieved_docs": [],
-        "doc_context": "",
-        "web_sources": [],
-        "full_context": "",
-        "structured_answer": None,
-        "sources": [],
-        "completeness_verdict": None,
-        "iteration_count": 0,
-        "enrichment_log": [],
-        "persisted_web_sources": 0,
-        "final_status": "",
-        "error": None,
-    }
-
     print("=" * 60)
     print("LIVE PROGRESS")
     print("=" * 60)
 
-    state = dict(initial_state)
-    for update in app.stream(initial_state, stream_mode="updates"):
-        for node_name, delta in update.items():
-            state.update(delta)
-            print(describe_step(node_name, delta))
+    state = initial_state(args.question)
+    # One parent trace for the whole question, same as the API path.
+    with tracing.question_trace(args.question):
+        for update in app.stream(dict(state), stream_mode="updates"):
+            for node_name, delta in update.items():
+                state.update(delta)
+                print(describe_step(node_name, delta))
+    tracing.flush()
+
+    if args.show_retrieval and state.get("retrieval_debug", {}).get("scores"):
+        print("\nRetrieval scores (dense relevance / lexical IDF coverage / fused RRF):")
+        for key, scores in state["retrieval_debug"]["scores"].items():
+            dense = scores.get("dense")
+            dense_text = f"{dense:.3f}" if isinstance(dense, float) else "n/a"
+            print(
+                f"  {key[:12]}  dense={dense_text}  "
+                f"lexical={scores.get('lexical', 0.0):.3f}  "
+                f"fused={scores.get('fused', 0.0):.5f}"
+            )
 
     print("\n" + "=" * 60)
     print(f"FINAL STATUS: {state['final_status']}")
@@ -116,32 +133,46 @@ def main():
         print(f"[Error: {state['error']}]")
         return
 
-    answer = state["structured_answer"]
-    verdict = state["completeness_verdict"]
+    answer = state.get("structured_answer")
+    verdict = state.get("completeness_verdict")
 
-    print("\nAnswer:")
-    print(answer.answer)
-    print(f"\nGenerator's self-reported confidence: {answer.confidence:.2f}")
+    if answer:
+        print("\nAnswer:")
+        print(answer.answer)
+        print(f"\nGenerator's self-reported confidence: {answer.confidence:.2f}")
+        if answer.missing_info:
+            print("\nStill missing:")
+            for item in answer.missing_info:
+                print(f"  - {item}")
+
     if verdict:
-        print(f"Independent critic's final verdict: {verdict.action} (sufficiency: {verdict.sufficiency_score:.2f})")
+        print(
+            f"Independent critic's final verdict: {verdict.action} "
+            f"(sufficiency: {verdict.sufficiency_score:.2f})"
+        )
+        if verdict.gap_description:
+            print(f"Gap: {verdict.gap_description}")
 
     if state["iteration_count"] > 0:
-        print(f"\nEnrichment rounds used: {state['iteration_count']} / {app_max_note()}")
+        print(
+            f"\nEnrichment rounds used: {state['iteration_count']} / "
+            f"{config.MAX_ENRICHMENT_ITERATIONS}"
+        )
 
-    if state.get("sources"):
-        print("\nDocument sources used:")
-        for s in state["sources"]:
-            print(f"  - {s}")
+    if state.get("citations"):
+        print("\nSources cited:")
+        for c in state["citations"]:
+            location = f" ({c.url})" if c.url else ""
+            print(f"  - [{c.kind}] {c.label}{location}")
 
-    if state.get("web_sources"):
-        print("\nWeb sources consulted:")
-        for w in state["web_sources"]:
+    web_uncited = [
+        w for w in state.get("web_sources", [])
+        if w.get("href") not in {c.url for c in state.get("citations", [])}
+    ]
+    if web_uncited:
+        print("\nWeb results consulted but not cited:")
+        for w in web_uncited:
             print(f"  - {w.get('title', 'untitled')} ({w.get('href', '')})")
-
-
-def app_max_note():
-    from src.config import config
-    return config.MAX_ENRICHMENT_ITERATIONS
 
 
 if __name__ == "__main__":

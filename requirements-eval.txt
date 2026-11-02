@@ -1,0 +1,10 @@
+# Optional extras for eval/ragas_eval.py only.
+#
+# Kept out of requirements.txt on purpose: ragas pulls in datasets,
+# pandas, pyarrow and an OpenAI client - a few hundred MB that the
+# service itself never imports, and that CI (which runs the offline
+# suite) has no reason to install.
+#
+#   pip install -r requirements-eval.txt
+ragas~=0.4
+datasets~=5.1

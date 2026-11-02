@@ -1,0 +1,44 @@
+Aria Cloud Storage - Support and Service Level Agreement
+
+Support channels
+
+All plans include email support at support@aria.example. Starter customers
+receive a first response within two business days. Team customers receive a
+first response within eight business hours and gain access to live chat
+during the hours of 09:00 to 18:00 UTC on weekdays. Enterprise customers
+receive a first response within one hour for incidents classified as
+Severity 1, and are assigned a named technical account manager.
+
+Severity definitions
+
+Severity 1 means the service is completely unavailable, or customer data is
+inaccessible, for all users in an organisation. Severity 2 means a core
+feature such as file synchronisation or sharing is unavailable while the
+rest of the service functions. Severity 3 covers degraded performance and
+partial feature failures. Severity 4 covers questions, documentation
+requests, and cosmetic defects.
+
+Uptime commitment
+
+Aria commits to 99.9% monthly uptime for Team plans and 99.95% monthly
+uptime for Enterprise plans. The Starter plan carries no contractual uptime
+commitment. Uptime is measured as the percentage of one-minute intervals in
+a calendar month during which the synchronisation API responded
+successfully to Aria's own monitoring probes. Scheduled maintenance
+announced at least 72 hours in advance is excluded from the calculation.
+
+Service credits
+
+If monthly uptime falls below the committed figure, affected customers may
+claim a service credit against the following month's invoice: 10% for
+uptime between 99.0% and the commitment, 25% for uptime between 95.0% and
+99.0%, and 50% for uptime below 95.0%. Credits must be requested in writing
+within 30 days of the end of the affected month. Credits are the sole
+remedy for missed uptime and are not paid out in cash.
+
+Escalation
+
+A Severity 1 incident that remains unresolved after four hours is escalated
+to the on-call engineering manager automatically. Enterprise customers may
+additionally request escalation through their technical account manager at
+any severity level.

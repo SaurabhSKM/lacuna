@@ -9,12 +9,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # More than one version on purpose. The previous requirements.txt
+        # was a `pip freeze` dump that pinned numpy and networkx to
+        # versions requiring Python >= 3.12, against a job pinned to
+        # 3.11 - so `pip install -r requirements.txt` failed outright and
+        # this workflow could never have passed. A matrix makes that
+        # class of mistake visible immediately rather than on whichever
+        # interpreter the next contributor happens to have.
+        python-version: ["3.11", "3.12", "3.13"]
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       - name: Install dependencies
@@ -23,10 +35,14 @@ jobs:
           pip install -r requirements.txt
 
       # No API keys or secrets are configured for this job on purpose.
-      # The whole suite was built to run offline (fake embeddings, pure
-      # scoring/routing functions, a no-API-key failure path), so CI never
-      # needs credentials - and a test that quietly started needing a
-      # real key would fail here immediately instead of passing locally
-      # and breaking later.
+      # The whole suite was built to run offline (fake embeddings, a
+      # deterministic stub LLM provider, pure scoring/routing functions,
+      # a no-API-key failure path), so CI never needs credentials - and a
+      # test that quietly started needing a real key would fail here
+      # immediately instead of passing locally and breaking later.
       - name: Run offline test suite
         run: pytest tests/ -v
+
+      - name: Check the service imports and starts
+        run: |
+          python -c "from src.api import app; print(app.title, app.version)"
